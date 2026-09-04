@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""vpn — lightweight Pritunl VPN client (stdlib-only).
+
+Wraps the pritunl-client CLI with automatic TOTP (RFC 6238) generation.
+
+Commands:
+  connect       Connect the profile using PIN + TOTP
+  disconnect    Disconnect the profile
+  status        Show profile state (exit code 0 = connected, 1 = not)
+  totp          Print the current TOTP code (--copy puts it on the clipboard)
+  ensure        Connect if not connected (used by the LaunchAgent watchdog)
+  install       Install LaunchAgent: connect at login + 60s watchdog
+  uninstall     Remove the LaunchAgent
+
+Config: ~/.config/vpn-connector/config.json (0600)
+  {
+    "profile_id": "<pritunl-client profile id>",
+    "totp_secret": "BASE32SECRET",
+    "pin": "555555",
+    "pritunl_client": "/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+  }
+
+Only "totp_secret" is required. "profile_id" is auto-detected when exactly
+one profile is registered with pritunl-client.
+"""
+
+import argparse
+import base64
+import hashlib
+import hmac
+import json
+import os
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+HOME = Path.home()
+CONFIG_PATH = HOME / ".config" / "vpn-connector" / "config.json"
+PLIST_LABEL = "com.local.vpn-daemon"
+PLIST_PATH = HOME / "Library" / "LaunchAgents" / (PLIST_LABEL + ".plist")
+LOG_PATH = HOME / "Library" / "Logs" / "vpn-connector.log"
+WATCHDOG_INTERVAL = 5
+CONNECT_TIMEOUT = 25
+DEFAULT_CLIENT = "/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+
+
+class VPNError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+
+def load_config() -> Dict[str, Any]:
+    if not CONFIG_PATH.exists():
+        raise VPNError(
+            "Config not found: {}\nCreate it with at least {{\"totp_secret\": \"...\"}}".format(CONFIG_PATH)
+        )
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        raise VPNError("Invalid JSON in {}: {}".format(CONFIG_PATH, exc))
+    if not isinstance(cfg, dict) or not cfg.get("totp_secret"):
+        raise VPNError("Config must contain a non-empty \"totp_secret\"")
+    cfg.setdefault("pin", "")
+    cfg.setdefault("pritunl_client", DEFAULT_CLIENT)
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# TOTP (RFC 6238, SHA-1, 6 digits, 30s period — Pritunl defaults)
+# ---------------------------------------------------------------------------
+
+
+def totp_now(secret: str) -> Tuple[str, int]:
+    key = base64.b32decode(secret.replace(" ", "").upper() + "=" * (-len(secret) % 8), casefold=True)
+    counter = int(time.time()) // 30
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    binary = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    code = "{:06d}".format(binary % 1000000)
+    return code, 30 - int(time.time()) % 30
+
+
+# ---------------------------------------------------------------------------
+# pritunl-client interaction
+# ---------------------------------------------------------------------------
+
+
+def run_client(client: str, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            [client] + list(args), capture_output=True, text=True, timeout=timeout
+        )
+    except FileNotFoundError:
+        raise VPNError("pritunl-client not found at: " + client)
+    except subprocess.TimeoutExpired:
+        raise VPNError("pritunl-client timed out: {} {}".format(client, " ".join(args)))
+
+
+def parse_list(text: str) -> list:
+    rows = []
+    for line in text.splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 7 or cells[0] in ("", "ID"):
+            continue
+        rows.append(
+            {
+                "id": cells[0],
+                "name": cells[1],
+                "state": cells[2],
+                "server_addr": cells[5],
+                "client_addr": cells[6],
+            }
+        )
+    return rows
+
+
+def get_rows(client: str) -> list:
+    result = run_client(client, "list")
+    if result.returncode != 0:
+        raise VPNError("pritunl-client list failed: " + (result.stderr or result.stdout).strip())
+    return parse_list(result.stdout)
+
+
+def resolve_profile_id(cfg: Dict[str, Any]) -> str:
+    pid = cfg.get("profile_id", "")
+    if pid:
+        return pid
+    rows = get_rows(cfg["pritunl_client"])
+    if len(rows) == 1:
+        return rows[0]["id"]
+    if not rows:
+        raise VPNError("No pritunl-client profiles found; register one and set \"profile_id\" in config")
+    raise VPNError(
+        "Multiple profiles registered; set \"profile_id\" in {}: {}".format(
+            CONFIG_PATH, ", ".join(r["id"] for r in rows)
+        )
+    )
+
+
+def get_profile(client: str, pid: str) -> Optional[Dict[str, str]]:
+    for row in get_rows(client):
+        if row["id"] == pid:
+            return row
+    return None
+
+
+def start_and_poll(client: str, pid: str, secret: str, pin: str) -> Tuple[Optional[Dict[str, str]], str]:
+    """Start the profile with PIN+TOTP; poll until active. Returns (row, error)."""
+    code, _ = totp_now(secret)
+    password = pin + code if pin else code
+    result = run_client(client, "start", pid, "-p", password)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip().splitlines()
+        return None, "start failed: " + (detail[-1] if detail else "exit {}".format(result.returncode))
+
+    deadline = time.time() + CONNECT_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(2)
+        row = get_profile(client, pid)
+        state = (row or {}).get("state", "unknown").lower()
+        if state == "active":
+            # state flips to active slightly before addresses are reported;
+            # give the daemon a few seconds to fill them in
+            addr_deadline = time.time() + 6
+            while time.time() < addr_deadline and (row or {}).get("client_addr", "-") in ("", "-"):
+                time.sleep(1)
+                row = get_profile(client, pid) or row
+            return row, ""
+        if state == "inactive":
+            return None, "rejected"
+    return None, "timeout (still connecting?)"
+
+
+def connect_profile(cfg: Dict[str, Any]) -> Tuple[int, str]:
+    client = cfg["pritunl_client"]
+    pid = resolve_profile_id(cfg)
+    row = get_profile(client, pid)
+    if row is None:
+        return 1, "profile {} not found in pritunl-client".format(pid)
+    if row["state"].lower() == "active":
+        return 0, "already connected: {} -> {}".format(row["client_addr"], row["server_addr"])
+
+    row, error = start_and_poll(client, pid, cfg["totp_secret"], cfg["pin"])
+    if error == "rejected":
+        # TOTP may have expired mid-flight; retry once with a fresh code
+        row, error = start_and_poll(client, pid, cfg["totp_secret"], cfg["pin"])
+    if row is not None:
+        return 0, "connected: {} -> {}".format(row["client_addr"], row["server_addr"])
+    return 1, "not connected: " + error
+
+
+def log(message: str) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with open(LOG_PATH, "a", encoding="utf-8") as handle:
+        handle.write("[{}] {}\n".format(stamp, message))
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+
+def cmd_connect(cfg: Dict[str, Any]) -> int:
+    code, message = connect_profile(cfg)
+    print(message)
+    return code
+
+
+def cmd_disconnect(cfg: Dict[str, Any]) -> int:
+    client = cfg["pritunl_client"]
+    pid = resolve_profile_id(cfg)
+    row = get_profile(client, pid)
+    if row is None:
+        print("profile {} not found".format(pid))
+        return 1
+    if row["state"].lower() == "inactive":
+        print("already disconnected")
+        return 0
+    result = run_client(client, "stop", pid)
+    if result.returncode != 0:
+        print("stop failed: " + (result.stderr or result.stdout).strip())
+        return 1
+    deadline = time.time() + 20
+    state = "unknown"
+    while time.time() < deadline:
+        time.sleep(2)
+        row = get_profile(client, pid)
+        state = (row or {}).get("state", "unknown").lower()
+        if state == "inactive":
+            break
+    print("disconnected" if state == "inactive" else "state: " + state)
+    return 0 if state == "inactive" else 1
+
+
+def cmd_status(cfg: Dict[str, Any]) -> int:
+    client = cfg["pritunl_client"]
+    pid = resolve_profile_id(cfg)
+    row = get_profile(client, pid)
+    if row is None:
+        print("Profile: {}\nState:   not found".format(pid))
+        return 1
+    print(
+        "Profile: {} ({})\nState:   {}\nClient:  {}\nServer:  {}".format(
+            row["id"], row["name"], row["state"], row["client_addr"], row["server_addr"]
+        )
+    )
+    return 0 if row["state"].lower() == "active" else 1
+
+
+def cmd_totp(cfg: Dict[str, Any], copy_to_clipboard: bool = False) -> int:
+    code, remaining = totp_now(cfg["totp_secret"])
+    if copy_to_clipboard:
+        subprocess.run(["/usr/bin/pbcopy"], input=code, text=True, check=False)
+        print("{} (valid {}s) — copied".format(code, remaining))
+    else:
+        print("{} (valid {}s)".format(code, remaining))
+    return 0
+
+
+def cmd_ensure(cfg: Dict[str, Any]) -> int:
+    """Watchdog entry point: connect if not connected. Quiet when all is well."""
+    client = cfg["pritunl_client"]
+    try:
+        pid = resolve_profile_id(cfg)
+        row = get_profile(client, pid)
+    except VPNError as exc:
+        log("ensure error: {}".format(exc))
+        return 1
+    if row is None:
+        log("ensure: profile {} not found".format(pid))
+        return 1
+    state = row["state"].lower()
+    if state in ("active", "connecting"):
+        return 0
+    log("ensure: state={} -> connecting {}".format(state, pid))
+    code, message = connect_profile(cfg)
+    log("ensure: " + message)
+    return code
+
+
+def cmd_daemon(cfg: Dict[str, Any]) -> int:
+    """Persistent watchdog loop (run under launchd KeepAlive).
+
+    Polls every WATCHDOG_INTERVAL seconds and reconnects when the profile is
+    down. Never exits on errors (launchd would just restart it); logs only
+    state transitions.
+    """
+    client = cfg["pritunl_client"]
+    log("daemon started (interval {}s)".format(WATCHDOG_INTERVAL))
+    while True:
+        try:
+            pid = resolve_profile_id(cfg)
+            row = get_profile(client, pid)
+            state = (row or {}).get("state", "unknown").lower() if row else "missing"
+            if state in ("active", "connecting"):
+                pass
+            elif state == "missing":
+                log("daemon: profile {} not found".format(pid))
+            else:
+                log("daemon: state={} -> connecting {}".format(state, pid))
+                code, message = connect_profile(cfg)
+                log("daemon: " + message)
+                if code != 0:
+                    time.sleep(WATCHDOG_INTERVAL * 3)
+        except Exception as exc:  # never die
+            log("daemon error: {!r}".format(exc))
+        time.sleep(WATCHDOG_INTERVAL)
+
+
+PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>{script}</string>
+        <string>daemon</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"""
+
+
+def cmd_install() -> int:
+    script = Path(__file__).resolve()
+    plist = PLIST_TEMPLATE.format(
+        label=PLIST_LABEL,
+        script=script,
+        log=LOG_PATH,
+    )
+    PLIST_PATH.write_text(plist, encoding="utf-8")
+    uid = os.getuid()
+    subprocess.run(
+        ["/bin/launchctl", "bootout", "gui/{}/{}".format(uid, PLIST_LABEL)],
+        capture_output=True,
+        check=False,
+    )
+    result = subprocess.run(
+        ["/bin/launchctl", "bootstrap", "gui/{}".format(uid), str(PLIST_PATH)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print("launchctl bootstrap failed: " + (result.stderr or result.stdout).strip())
+        return 1
+
+    bin_dir = HOME / ".local" / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    link = bin_dir / "vpn"
+    if link.is_symlink() or link.exists():
+        link.unlink()
+    link.symlink_to(script)
+
+    print("Installed LaunchAgent: {}".format(PLIST_PATH))
+    print("  - starts at login (RunAtLoad) and stays running (KeepAlive)")
+    print("  - watchdog loop reconnects within ~{}s of a drop or wake from sleep".format(WATCHDOG_INTERVAL + 10))
+    print("  - log: {}".format(LOG_PATH))
+    print("CLI symlink: {} -> {}".format(link, script))
+    return 0
+
+
+def cmd_uninstall() -> int:
+    uid = os.getuid()
+    for label in (PLIST_LABEL, "com.local.vpn-connector"):
+        subprocess.run(
+            ["/bin/launchctl", "bootout", "gui/{}/{}".format(uid, label)],
+            capture_output=True,
+            check=False,
+        )
+        stale = HOME / "Library" / "LaunchAgents" / (label + ".plist")
+        if stale.exists():
+            stale.unlink()
+    link = HOME / ".local" / "bin" / "vpn"
+    if link.is_symlink():
+        link.unlink()
+    print("Removed LaunchAgent and symlink")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="vpn", description="Lightweight Pritunl VPN client with TOTP")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("connect", help="connect using PIN + TOTP")
+    sub.add_parser("disconnect", help="disconnect")
+    sub.add_parser("status", help="show profile state (exit 0 = connected)")
+    p_totp = sub.add_parser("totp", help="print current TOTP code")
+    p_totp.add_argument("--copy", action="store_true", help="also copy code to clipboard")
+    sub.add_parser("ensure", help="connect if not connected (one-shot)")
+    sub.add_parser("daemon", help="run watchdog loop (used by LaunchAgent)")
+    sub.add_parser("install", help="install LaunchAgent (login start + watchdog daemon)")
+    sub.add_parser("uninstall", help="remove LaunchAgent")
+
+    args = parser.parse_args()
+    try:
+        if args.command == "install":
+            return cmd_install()
+        if args.command == "uninstall":
+            return cmd_uninstall()
+        cfg = load_config()
+        if args.command == "connect":
+            return cmd_connect(cfg)
+        if args.command == "disconnect":
+            return cmd_disconnect(cfg)
+        if args.command == "status":
+            return cmd_status(cfg)
+        if args.command == "totp":
+            return cmd_totp(cfg, copy_to_clipboard=args.copy)
+        if args.command == "ensure":
+            return cmd_ensure(cfg)
+        if args.command == "daemon":
+            return cmd_daemon(cfg)
+    except VPNError as exc:
+        print("error: {}".format(exc), file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

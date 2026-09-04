@@ -1,0 +1,9 @@
+# Real config contains secrets (TOTP secret, PIN) - never commit
+config.json
+
+# Python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
