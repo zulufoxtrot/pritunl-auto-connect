@@ -15,6 +15,8 @@ Backends:
   * Linux — pystray (GTK AppIndicator / XEmbed), plus Pillow for icons.
 """
 
+import io
+import os
 import subprocess
 import sys
 import threading
@@ -31,21 +33,24 @@ RED = (231, 76, 60)
 GREY = (127, 140, 141)
 YELLOW = (241, 196, 15)
 ICON_SIZE = 22
-DOT = 9  # status dot diameter
+DOT = 11  # status dot diameter
 
 POLL = 5
 
 _should_quit = threading.Event()
+_CONTROLLER = None
 
 ASSET_PATH = HERE / "assets" / "pritunl-base.png"
 
 
-def load_base(size: int = ICON_SIZE):
-    """Pritunl logo scaled to the tray size; None if the asset is missing."""
+RENDER = ICON_SIZE * 2  # render at 2x for crisp Retina menu-bar icons
+
+
+def load_base():
+    """Pritunl logo as a PIL image; None if Pillow/asset is missing."""
     try:
         from PIL import Image
-        img = Image.open(ASSET_PATH).convert("RGBA")
-        return img.resize((size, size), Image.LANCZOS)
+        return Image.open(ASSET_PATH).convert("RGBA")
     except Exception:
         return None
 
@@ -53,21 +58,50 @@ def load_base(size: int = ICON_SIZE):
 def make_overlay_image(base, color, enabled: bool = True):
     """Pritunl logo + coloured status dot (optional slash when disabled).
 
-    Used by both backends: PIL (Linux) and NSImage via a PNG round-trip
-    (macOS). Falls back to the old plain circle if Pillow/base is missing.
+    Rendered at ``RENDER`` px (2x) and scaled by the backend. Used by both
+    the Linux (pystray/Pillow) and macOS (Pillow -> NSImage) backends.
     """
     from PIL import Image, ImageDraw
     if base is None:
-        img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse([2, 2, ICON_SIZE - 2, ICON_SIZE - 2], fill=color + (255,))
+        img = Image.new("RGBA", (RENDER, RENDER), (0, 0, 0, 0))
     else:
-        img = base.copy()
+        img = base.resize((RENDER, RENDER), Image.LANCZOS).copy()
     d = ImageDraw.Draw(img)
-    d.ellipse([4, 4, 4 + DOT, 4 + DOT], fill=color + (255,), outline=(255, 255, 255, 255), width=1)
+    scale = RENDER / float(ICON_SIZE)
+    dot = int(DOT * scale)
+    m = int(4 * scale)
+    d.ellipse([m, m, m + dot, m + dot], fill=color + (255,),
+              outline=(255, 255, 255, 255), width=max(1, int(2 * scale)))
     if not enabled:
-        d.line([4, ICON_SIZE - 4, ICON_SIZE - 4, 4], fill=(255, 255, 255, 255), width=2)
+        d.line([m, RENDER - m, RENDER - m, m], fill=(255, 255, 255, 255),
+               width=max(1, int(2 * scale)))
     return img
+
+
+def render_icon_png(color, enabled: bool = True) -> bytes:
+    """Status icon as PNG bytes (logo + dot); ObjC-circle fallback if Pillow
+    is unavailable. Must be called on the main thread on macOS (NSImage)."""
+    try:
+        buf = io.BytesIO()
+        make_overlay_image(load_base(), color, enabled).save(buf, format="PNG")
+        return bytes(buf.getvalue())
+    except Exception:
+        from AppKit import NSBezierPath, NSColor, NSMakePoint, NSMakeRect, NSImage
+        image = NSImage.alloc().initWithSize_((ICON_SIZE, ICON_SIZE))
+        image.lockFocus()
+        NSColor.colorWithSRGBRed_green_blue_alpha_(
+            color[0] / 255.0, color[1] / 255.0, color[2] / 255.0, 1.0
+        ).setFill()
+        NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(4, 4, DOT, DOT)).fill()
+        if not enabled:
+            NSColor.whiteColor().setStroke()
+            p = NSBezierPath.bezierPath()
+            p.moveToPoint_(NSMakePoint(4, ICON_SIZE - 4))
+            p.lineToPoint_(NSMakePoint(ICON_SIZE - 4, 4))
+            p.setLineWidth_(2.0)
+            p.stroke()
+        image.unlockFocus()
+        return bytes(image.TIFFRepresentation().bytes().tobytes())
 
 
 # ---------------------------------------------------------------------------
@@ -184,117 +218,125 @@ def run_linux() -> int:
 
 def run_macos() -> int:
     import objc  # noqa: F401  (ensures PyObjC bridges are installed)
+    import queue
+    from Foundation import NSObject
     from AppKit import (
         NSApplication,
         NSApplicationActivationPolicyAccessory,
+        NSDate,
+        NSDefaultRunLoopMode,
         NSImage,
         NSMenu,
         NSMenuItem,
         NSStatusBar,
         NSVariableStatusItemLength,
     )
-    from Foundation import NSTimer
 
-    class TrayController:
-        def __init__(self):
-            self.app = NSApplication.sharedApplication()
-            self.app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-            self.statusbar = NSStatusBar.systemStatusBar()
-            self.item = self.statusbar.statusItemWithLength_(NSVariableStatusItemLength)
-            self._base = load_base(44)  # Retina-sized base for crisp scaling
-            # Render optimistically (grey "starting") so the icon appears
-            # instantly and never blocks on a slow status() call.
-            self.info = {"state": "unknown", "enabled": True, "client": "", "server": ""}
-            self._render()
-            self._refresh_async()
-            self._schedule()
+    # This Python/PyObjC build never delivers NSTimer callbacks nor
+    # performSelectorOnMainThread:withObject: — so we run the run loop by hand
+    # with nextEventMatchingMask:untilDate:inMode:dequeue: and marshal worker
+    # results through a plain queue. All AppKit access stays on the main
+    # thread; the worker thread only does blocking subprocess calls.
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+    statusbar = NSStatusBar.systemStatusBar()
+    item = statusbar.statusItemWithLength_(NSVariableStatusItemLength)
+    item.setHighlightMode_(1)
+    button = item.button()  # create ON the main thread (layout engine)
+    updates = queue.Queue()
+    stop = threading.Event()
 
-        def _nsimage(self, color):
-            enabled = bool(self.info.get("enabled", True))
-            img = make_overlay_image(self._base, color, enabled)
-            import io
-            buf = io.BytesIO()
-            img.save(buf, format="PNG")
-            data = bytes(buf.getvalue())
-            image = NSImage.alloc().initWithData_(data)
+    initial = {"state": "unknown", "enabled": True, "client": "", "server": ""}
+    state = {"info": initial}
+
+    def apply_info(info):
+        if os.environ.get('TRAY_DEBUG'):
+            print('apply_info state=%s enabled=%s' % (info['state'], info['enabled']), flush=True)
+        try:
+            image = NSImage.alloc().initWithData_(
+                render_icon_png(color_for(info), bool(info["enabled"]))
+            )
             image.setSize_((ICON_SIZE, ICON_SIZE))
-            return image
+            button.setImage_(image)
+            button.setToolTip_(tooltip(info))
+        except Exception:
+            pass
+        item.setMenu_(build_menu(info))
 
-        def _render(self):
-            # Pure UI: runs on the main thread from cached info, never blocks.
-            info = self.info
-            self.item.button().setImage_(self._nsimage(color_for(info)))
-            self.item.button().setToolTip_(tooltip(info))
-            menu = NSMenu.alloc().init()
-            active = info["state"] == "active"
-            connect = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Disconnect" if active else "Connect", "toggleConnect:", ""
-            )
-            connect.setTarget_(self)
-            menu.addItem_(connect)
-            auto = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "Auto-reconnect: {}".format("on" if info["enabled"] else "off"),
-                "toggleAuto:", "",
-            )
-            auto.setTarget_(self)
-            menu.addItem_(auto)
-            menu.addItem_(NSMenuItem.separatorItem())
-            quit_ = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "quit:", "q")
-            quit_.setTarget_(self)
-            menu.addItem_(quit_)
-            self.item.setMenu_(menu)
-
-        def _do_on_main(self, sel):
-            self.app.performSelectorOnMainThread_withObject_waitUntilDone_(
-                sel, None, False
-            )
-
-        def _refresh_async(self):
-            def bg():
-                self.info = status()  # worker thread does the slow work
-                self._do_on_main("_render")
-            threading.Thread(target=bg, daemon=True).start()
-
+    class Controller(NSObject):
         def toggleConnect_(self, _sender):
-            want_disconnect = self.info["state"] == "active"
-            self.info = dict(self.info, state="connecting")  # optimistic feedback
-            self._render()
+            want_disconnect = state["info"]["state"] == "active"
+            state["info"] = dict(state["info"], state="connecting")
+            apply_info(state["info"])
 
-            def bg():
-                (disconnect_info() if want_disconnect else connect_info())
-                self.info = status()
-                self._do_on_main("_render")
-            threading.Thread(target=bg, daemon=True).start()
+            def job():
+                disconnect_info() if want_disconnect else connect_info()
+                updates.put(status())
+            threading.Thread(target=job, daemon=True).start()
 
         def toggleAuto_(self, _sender):
-            want_off = self.info["enabled"]
-            self.info = dict(self.info, enabled=not want_off)
-            self._render()
+            want_off = bool(state["info"].get("enabled", True))
+            state["info"] = dict(state["info"], enabled=not want_off)
+            apply_info(state["info"])
 
-            def bg():
+            def job():
                 run_vpn("disable" if want_off else "enable")
-                self.info = status()
-                self._do_on_main("_render")
-            threading.Thread(target=bg, daemon=True).start()
+                updates.put(status())
+            threading.Thread(target=job, daemon=True).start()
 
         def quit_(self, _sender):
-            _should_quit.set()
-            self.app.terminate_(None)
+            stop.set()
 
-        def _tick(self, _timer):
-            if _should_quit.is_set():
-                return
-            self._render()        # repaint instantly from cache
-            self._refresh_async() # then poll in background
-            self._schedule()
+    controller = Controller.alloc().init()
+    global _CONTROLLER
+    _CONTROLLER = controller  # keep the ObjC target alive
 
-        def _schedule(self):
-            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-                POLL, self, "_tick:", None, False
-            )
+    def build_menu(info):
+        active = info["state"] == "active"
+        menu = NSMenu.alloc().init()
+        connect = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Disconnect" if active else "Connect", "toggleConnect:", ""
+        )
+        connect.setTarget_(controller)
+        menu.addItem_(connect)
+        auto = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Auto-reconnect: {}".format("on" if info["enabled"] else "off"),
+            "toggleAuto:", "",
+        )
+        auto.setTarget_(controller)
+        menu.addItem_(auto)
+        menu.addItem_(NSMenuItem.separatorItem())
+        quit_ = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "quit:", "q")
+        quit_.setTarget_(controller)
+        menu.addItem_(quit_)
+        return menu
 
-    controller = TrayController()
-    controller.app.run()
+    apply_info(initial)
+
+    def poll_worker():
+        while not stop.is_set() and not _should_quit.is_set():
+            try:
+                updates.put(status())
+            except Exception:
+                pass
+            stop.wait(POLL)
+
+    threading.Thread(target=poll_worker, daemon=True).start()
+
+    # Main-thread event pump: apply queued updates, then process AppKit events.
+    while not stop.is_set() and not _should_quit.is_set():
+        try:
+            while True:
+                state["info"] = updates.get_nowait()
+                apply_info(state["info"])
+        except queue.Empty:
+            pass
+        event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+            0xFFFFFFFF, NSDate.dateWithTimeIntervalSinceNow_(0.2),
+            NSDefaultRunLoopMode, True,
+        )
+        if event is not None:
+            app.sendEvent_(event)
     return 0
 
 
