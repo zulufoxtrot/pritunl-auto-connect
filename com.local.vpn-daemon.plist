@@ -7,7 +7,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/usr/bin/python3</string>
-        <string>/Users/ylecottier/scripts/pritnul_auto_connect/vpn</string>
+        <string>/Users/ylecottier/scripts/pritunl-auto-reconnect/vpn</string>
         <string>daemon</string>
     </array>
     <key>RunAtLoad</key>

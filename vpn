@@ -1,27 +1,38 @@
 #!/usr/bin/env python3
-"""vpn — lightweight Pritunl VPN client (stdlib-only).
+"""vpn — lightweight, cross-platform Pritunl VPN client (stdlib-only core).
 
-Wraps the pritunl-client CLI with automatic TOTP (RFC 6238) generation.
+Wraps the ``pritunl-client`` CLI with automatic TOTP (RFC 6238) generation,
+a sleep-safe watchdog that keeps the tunnel connected, an enable/disable
+switch, and a diagnostics command.
 
 Commands:
   connect       Connect the profile using PIN + TOTP
   disconnect    Disconnect the profile
   status        Show profile state (exit code 0 = connected, 1 = not)
   totp          Print the current TOTP code (--copy puts it on the clipboard)
-  ensure        Connect if not connected (used by the LaunchAgent watchdog)
-  install       Install LaunchAgent: connect at login + 60s watchdog
-  uninstall     Remove the LaunchAgent
+  enable        Enable auto-reconnect (watchdog reconnects when down)
+  disable       Disable auto-reconnect and disconnect immediately
+  enabled       Print whether auto-reconnect is enabled
+  ensure        Connect if not connected and auto-reconnect is enabled
+  daemon        Run the watchdog loop (used by the service manager)
+  diag          Snapshot routing / DNS / reachability (diagnose sleep issues)
+  install       Install the service manager unit (daemon + optional tray)
+  uninstall     Remove the service manager units
 
 Config: ~/.config/vpn-connector/config.json (0600)
   {
-    "profile_id": "<pritunl-client profile id>",
-    "totp_secret": "BASE32SECRET",
-    "pin": "555555",
-    "pritunl_client": "/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+    "profile_id": "<pritunl-client profile id>",     # optional, auto-detected
+    "totp_secret": "BASE32SECRET",                      # required
+    "pin": "555555",                                    # optional
+    "pritunl_client": "/path/to/pritunl-client",      # optional, auto-detected
+    "auto_wifi_reset": false                          # optional, default off
   }
 
-Only "totp_secret" is required. "profile_id" is auto-detected when exactly
-one profile is registered with pritunl-client.
+Runtime state: ~/.config/vpn-connector/state.json
+  { "enabled": true }
+
+Supported platforms: macOS (launchd) and Linux/Ubuntu (systemd user units).
+The tray UI lives in the sibling ``tray.py`` and needs ``pystray`` + Pillow.
 """
 
 import argparse
@@ -30,21 +41,48 @@ import hashlib
 import hmac
 import json
 import os
+import platform
+import shutil
 import struct
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+IS_MAC = sys.platform == "darwin"
+IS_LINUX = sys.platform.startswith("linux")
 
 HOME = Path.home()
-CONFIG_PATH = HOME / ".config" / "vpn-connector" / "config.json"
-PLIST_LABEL = "com.local.vpn-daemon"
-PLIST_PATH = HOME / "Library" / "LaunchAgents" / (PLIST_LABEL + ".plist")
-LOG_PATH = HOME / "Library" / "Logs" / "vpn-connector.log"
+HERE = Path(__file__).resolve().parent
+CONFIG_DIR = HOME / ".config" / "vpn-connector"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_PATH = CONFIG_DIR / "state.json"
+
 WATCHDOG_INTERVAL = 5
 CONNECT_TIMEOUT = 25
-DEFAULT_CLIENT = "/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+# When the profile has been down this many consecutive checks and we still
+# cannot bring it up, optionally reset Wi-Fi (if auto_wifi_reset is enabled).
+WAKE_SETTLE_SECONDS = 8
+WIFI_RESET_AFTER_FAILS = 3
+
+if IS_MAC:
+    SERVICE_LABEL = "com.local.vpn-daemon"
+    TRAY_LABEL = "com.local.vpn-tray"
+    PLIST_PATH = HOME / "Library" / "LaunchAgents" / (SERVICE_LABEL + ".plist")
+    TRAY_PLIST_PATH = HOME / "Library" / "LaunchAgents" / (TRAY_LABEL + ".plist")
+    LOG_PATH = HOME / "Library" / "Logs" / "vpn-connector.log"
+    DEFAULT_CLIENT = "/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+elif IS_LINUX:
+    SERVICE_LABEL = "pritunl-auto-reconnect"
+    TRAY_LABEL = "pritunl-auto-reconnect-tray"
+    LOG_PATH = HOME / ".local" / "state" / "vpn-connector.log"
+    DEFAULT_CLIENT = "/usr/bin/pritunl-client"
+else:
+    SERVICE_LABEL = "vpn-daemon"
+    TRAY_LABEL = "vpn-tray"
+    LOG_PATH = HOME / ".vpn-connector.log"
+    DEFAULT_CLIENT = "pritunl-client"
 
 
 class VPNError(Exception):
@@ -52,7 +90,354 @@ class VPNError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Config
+# Platform operations
+#
+# All OS-specific behaviour lives behind this interface so the core logic
+# stays shared between macOS and Linux.
+# ---------------------------------------------------------------------------
+
+
+class PlatformOps:
+    """Shared logic; subclasses override the handful of OS-specific bits."""
+
+    name = "generic"
+
+    def detect_client(self, cfg: Dict[str, Any]) -> str:
+        from_cfg = cfg.get("pritunl_client")
+        if from_cfg:
+            return from_cfg
+        found = shutil.which("pritunl-client") or shutil.which("pritunl")
+        return found or DEFAULT_CLIENT
+
+    # --- service manager ---
+    def install_service(self, script: Path, python: Path, log: Path) -> Tuple[int, str]:
+        raise NotImplementedError
+
+    def uninstall_service(self) -> int:
+        raise NotImplementedError
+
+    def install_tray(self, script: Path, python: Path) -> Tuple[int, str]:
+        raise NotImplementedError
+
+    def uninstall_tray(self) -> int:
+        raise NotImplementedError
+
+    # --- clipboard ---
+    def copy_to_clipboard(self, text: str) -> None:
+        raise NotImplementedError
+
+    # --- network diagnostics / reset ---
+    def default_route(self) -> str:
+        raise NotImplementedError
+
+    def dns_servers(self) -> str:
+        raise NotImplementedError
+
+    def wifi_reset(self) -> Tuple[int, str]:
+        raise NotImplementedError
+
+    def internet_ok(self) -> bool:
+        # 1.1.1.1:53 is a reliable, DNS-free reachability probe. macOS ping
+        # takes deadline as -t (seconds); Linux takes timeout as -W (seconds).
+        if IS_MAC:
+            cmd = ["/sbin/ping", "-c", "1", "-t", "3", "1.1.1.1"]
+        elif IS_LINUX:
+            cmd = ["/bin/ping", "-c", "1", "-W", "2", "1.1.1.1"]
+        else:
+            cmd = ["ping", "-c", "1", "1.1.1.1"]
+        try:
+            r = subprocess.run(cmd, capture_output=True, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+
+class MacOSOps(PlatformOps):
+    name = "darwin"
+
+    def _launchctl(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["/bin/launchctl", *args], capture_output=True, text=True)
+
+    def install_service(self, script: Path, python: Path, log: Path) -> Tuple[int, str]:
+        plist = MAC_PLIST_TEMPLATE.format(
+            label=SERVICE_LABEL, script=script, python=python, log=log, command="\n        <string>daemon</string>"
+        )
+        PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        PLIST_PATH.write_text(plist, encoding="utf-8")
+        self._launchctl("bootout", "gui/{}/{}".format(os.getuid(), SERVICE_LABEL))
+        r = self._launchctl("bootstrap", "gui/{}".format(os.getuid()), str(PLIST_PATH))
+        if r.returncode != 0:
+            return 1, "launchctl bootstrap failed: " + (r.stderr or r.stdout).strip()
+        return 0, "installed launchd job {}".format(PLIST_PATH)
+
+    def uninstall_service(self) -> int:
+        for label in (SERVICE_LABEL, "com.local.vpn-connector"):
+            self._launchctl("bootout", "gui/{}/{}".format(os.getuid(), label))
+            stale = HOME / "Library" / "LaunchAgents" / (label + ".plist")
+            if stale.exists():
+                stale.unlink()
+        return 0
+
+    def install_tray(self, script: Path, python: Path) -> Tuple[int, str]:
+        plist = MAC_PLIST_TEMPLATE.format(
+            label=TRAY_LABEL, script=str(HERE / "tray.py"), python=python, log=LOG_PATH, command=""
+        )
+        TRAY_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TRAY_PLIST_PATH.write_text(plist, encoding="utf-8")
+        self._launchctl("bootout", "gui/{}/{}".format(os.getuid(), TRAY_LABEL))
+        r = self._launchctl("bootstrap", "gui/{}".format(os.getuid()), str(TRAY_PLIST_PATH))
+        if r.returncode != 0:
+            return 1, "launchctl bootstrap failed: " + (r.stderr or r.stdout).strip()
+        return 0, "installed tray launchd job {}".format(TRAY_PLIST_PATH)
+
+    def uninstall_tray(self) -> int:
+        self._launchctl("bootout", "gui/{}/{}".format(os.getuid(), TRAY_LABEL))
+        if TRAY_PLIST_PATH.exists():
+            TRAY_PLIST_PATH.unlink()
+        return 0
+
+    def copy_to_clipboard(self, text: str) -> None:
+        subprocess.run(["/usr/bin/pbcopy"], input=text, text=True, check=False)
+
+    def default_route(self) -> str:
+        try:
+            r = subprocess.run(
+                ["/sbin/route", "-n", "get", "default"], capture_output=True, text=True
+            )
+            return r.stdout
+        except Exception as exc:
+            return "route lookup failed: {!r}".format(exc)
+
+    def dns_servers(self) -> str:
+        try:
+            r = subprocess.run(["/usr/sbin/scutil"], input="show State:/Network/Global/DNS\n",
+                               capture_output=True, text=True)
+            return r.stdout
+        except Exception as exc:
+            return "dns lookup failed: {!r}".format(exc)
+
+    def wifi_reset(self) -> Tuple[int, str]:
+        # macOS: power-cycle the Wi-Fi interface via networksetup.
+        iface = _airport_device()
+        if not iface:
+            return 1, "no AirPort/Wi-Fi interface found"
+        try:
+            subprocess.run(["/usr/sbin/networksetup", "-setairportpower", iface, "off"],
+                           check=False, timeout=15)
+            time.sleep(3)
+            subprocess.run(["/usr/sbin/networksetup", "-setairportpower", iface, "on"],
+                           check=False, timeout=15)
+            return 0, "Wi-Fi ({}) power-cycled".format(iface)
+        except Exception as exc:
+            return 1, "Wi-Fi reset failed: {!r}".format(exc)
+
+
+class LinuxOps(PlatformOps):
+    name = "linux"
+
+    def _systemctl(self, *args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+
+    def _unit_path(self, label: str) -> Path:
+        return HOME / ".config" / "systemd" / "user" / (label + ".service")
+
+    def _write_unit(self, label: str, script: Path, python: Path, log: Path,
+                    extra_exec: Optional[List[str]] = None) -> Path:
+        exec_args = [str(python), str(script)] + (extra_exec or [])
+        unit = SYSTEMD_UNIT_TEMPLATE.format(
+            description=label,
+            exec_start=" ".join(_quote(a) for a in exec_args),
+            log=log,
+        )
+        path = self._unit_path(label)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(unit, encoding="utf-8")
+        return path
+
+    def install_service(self, script: Path, python: Path, log: Path) -> Tuple[int, str]:
+        self._write_unit(SERVICE_LABEL, script, python, log, extra_exec=["daemon"])
+        self._systemctl("daemon-reload")
+        r = self._systemctl("enable", "--now", SERVICE_LABEL + ".service")
+        if r.returncode != 0:
+            return 1, "systemctl enable failed: " + (r.stderr or r.stdout).strip()
+        return 0, "installed systemd user unit {}".format(SERVICE_LABEL + ".service")
+
+    def uninstall_service(self) -> Tuple[int, str]:
+        self._systemctl("disable", "--now", SERVICE_LABEL + ".service")
+        p = self._unit_path(SERVICE_LABEL)
+        if p.exists():
+            p.unlink()
+        self._systemctl("daemon-reload")
+        return 0
+
+    def install_tray(self, script: Path, python: Path) -> Tuple[int, str]:
+        # systemd user unit for the tray (so it stays running).
+        self._write_unit(TRAY_LABEL, script, python, LOG_PATH, extra_exec=["tray"])
+        self._systemctl("daemon-reload")
+        r = self._systemctl("enable", "--now", TRAY_LABEL + ".service")
+        # Also drop an autostart .desktop entry for desktop sessions.
+        autostart = HOME / ".config" / "autostart"
+        autostart.mkdir(parents=True, exist_ok=True)
+        (autostart / (TRAY_LABEL + ".desktop")).write_text(
+            LINUX_AUTOSTART_TEMPLATE.format(
+                label=TRAY_LABEL, python=python, script=script
+            ),
+            encoding="utf-8",
+        )
+        if r.returncode != 0:
+            return 1, "systemctl enable failed: " + (r.stderr or r.stdout).strip()
+        return 0, "installed systemd user unit + autostart entry"
+
+    def uninstall_tray(self) -> int:
+        self._systemctl("disable", "--now", TRAY_LABEL + ".service")
+        p = self._unit_path(TRAY_LABEL)
+        if p.exists():
+            p.unlink()
+        autostart = HOME / ".config" / "autostart" / (TRAY_LABEL + ".desktop")
+        if autostart.exists():
+            autostart.unlink()
+        self._systemctl("daemon-reload")
+        return 0
+
+    def copy_to_clipboard(self, text: str) -> None:
+        for tool, args in (("wl-copy", []), ("xclip", ["-selection", "clipboard"]),
+                           ("xsel", ["--clipboard", "--input"])):
+            if shutil.which(tool):
+                try:
+                    subprocess.run([tool] + args, input=text.encode("utf-8"), check=False,
+                                   timeout=5)
+                    return
+                except Exception:
+                    continue
+        # Fall back to printing so the code is at least visible.
+        print("(no clipboard tool found — copy manually)")
+
+    def default_route(self) -> str:
+        try:
+            r = subprocess.run(["ip", "route", "show", "default"], capture_output=True,
+                               text=True)
+            return r.stdout
+        except Exception as exc:
+            return "route lookup failed: {!r}".format(exc)
+
+    def dns_servers(self) -> str:
+        # Ubuntu LTS uses systemd-resolved.
+        out = ""
+        try:
+            r = subprocess.run(["resolvectl", "status"], capture_output=True, text=True)
+            if r.returncode == 0:
+                out = r.stdout
+        except Exception:
+            pass
+        if not out:
+            try:
+                out = Path("/etc/resolv.conf").read_text(encoding="utf-8")
+            except Exception as exc:
+                out = "dns lookup failed: {!r}".format(exc)
+        return out
+
+    def wifi_reset(self) -> Tuple[int, str]:
+        # Ubuntu LTS ships NetworkManager; nmcli is the correct toggle.
+        if shutil.which("nmcli"):
+            try:
+                subprocess.run(["nmcli", "radio", "wifi", "off"], check=False, timeout=15)
+                time.sleep(3)
+                subprocess.run(["nmcli", "radio", "wifi", "on"], check=False, timeout=15)
+                return 0, "Wi-Fi radio toggled via nmcli"
+            except Exception as exc:
+                return 1, "nmcli wifi reset failed: {!r}".format(exc)
+        if shutil.which("rfkill"):
+            try:
+                subprocess.run(["rfkill", "block", "wifi"], check=False, timeout=15)
+                time.sleep(3)
+                subprocess.run(["rfkill", "unblock", "wifi"], check=False, timeout=15)
+                return 0, "Wi-Fi radio toggled via rfkill"
+            except Exception as exc:
+                return 1, "rfkill wifi reset failed: {!r}".format(exc)
+        return 1, "no nmcli/rfkill available for Wi-Fi reset"
+
+
+def _airport_device() -> Optional[str]:
+    try:
+        r = subprocess.run(["networksetup", "-listallhardwareports"],
+                           capture_output=True, text=True)
+        lines = r.stdout.splitlines()
+        for i, line in enumerate(lines):
+            if "Wi-Fi" in line and i + 1 < len(lines):
+                return lines[i + 1].split("Device:")[-1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def _quote(arg: str) -> str:
+    if any(c in arg for c in " \t\n\"'\\$`!#&*|;:<>(){}~^"):
+        return '"' + arg.replace('"', '\\"') + '"'
+    return arg
+
+
+def get_ops() -> PlatformOps:
+    if IS_MAC:
+        return MacOSOps()
+    if IS_LINUX:
+        return LinuxOps()
+    return PlatformOps()
+
+
+MAC_PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{python}</string>
+        <string>{script}</string>{command}
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardOutPath</key>
+    <string>{log}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
+</dict>
+</plist>
+"""
+
+SYSTEMD_UNIT_TEMPLATE = """[Unit]
+Description={description}
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart={exec_start}
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:{log}
+StandardError=append:{log}
+
+[Install]
+WantedBy=default.target
+"""
+
+LINUX_AUTOSTART_TEMPLATE = """[Desktop Entry]
+Type=Application
+Name=Pritunl Auto-Reconnect Tray
+Exec={python} {script} tray
+X-GNOME-Autostart-enabled=true
+Hidden=false
+"""
+
+
+# ---------------------------------------------------------------------------
+# Config + state
 # ---------------------------------------------------------------------------
 
 
@@ -68,8 +453,27 @@ def load_config() -> Dict[str, Any]:
     if not isinstance(cfg, dict) or not cfg.get("totp_secret"):
         raise VPNError("Config must contain a non-empty \"totp_secret\"")
     cfg.setdefault("pin", "")
-    cfg.setdefault("pritunl_client", DEFAULT_CLIENT)
+    cfg.setdefault("auto_wifi_reset", False)
+    cfg.setdefault("pritunl_client", get_ops().detect_client(cfg))
     return cfg
+
+
+def load_state() -> Dict[str, Any]:
+    if STATE_PATH.exists():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except ValueError:
+            pass
+    return {"enabled": True}
+
+
+def save_state(state: Dict[str, Any]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def is_enabled() -> bool:
+    return bool(load_state().get("enabled", True))
 
 
 # ---------------------------------------------------------------------------
@@ -103,27 +507,43 @@ def run_client(client: str, *args: str, timeout: int = 30) -> subprocess.Complet
         raise VPNError("pritunl-client timed out: {} {}".format(client, " ".join(args)))
 
 
-def parse_list(text: str) -> list:
-    rows = []
+_HEADER_MAP = {
+    "id": "id",
+    "name": "name",
+    "state": "state",
+    "server address": "server_addr",
+    "client address": "client_addr",
+}
+
+
+def parse_list(text: str) -> List[Dict[str, str]]:
+    """Parse the ``pritunl-client list`` ASCII table by header name.
+
+    Maps columns by header label (not fixed index) so state/server/client stay
+    correct even if pritunl-client reorders its columns. The old fixed-index
+    parser read TYPE as STATE and shifted server/client, which made the
+    watchdog think an already-Active profile was "System" and spam reconnects.
+    """
+    rows: List[Dict[str, str]] = []
+    idx: Dict[str, int] = {}
     for line in text.splitlines():
-        if not line.strip().startswith("|"):
+        s = line.strip()
+        if not s.startswith("|"):
             continue
-        cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) < 7 or cells[0] in ("", "ID"):
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        low = [c.lower() for c in cells]
+        if "id" in low:  # header row (first cell is "id")
+            idx = {_HEADER_MAP[h]: i for i, h in enumerate(low) if h in _HEADER_MAP}
             continue
-        rows.append(
-            {
-                "id": cells[0],
-                "name": cells[1],
-                "state": cells[2],
-                "server_addr": cells[5],
-                "client_addr": cells[6],
-            }
-        )
+        if not idx or len(cells) <= max(idx.values()):
+            continue
+        if not cells[idx["id"]]:
+            continue
+        rows.append({k: cells[i] for k, i in idx.items()})
     return rows
 
 
-def get_rows(client: str) -> list:
+def get_rows(client: str) -> List[Dict[str, str]]:
     result = run_client(client, "list")
     if result.returncode != 0:
         raise VPNError("pritunl-client list failed: " + (result.stderr or result.stdout).strip())
@@ -168,8 +588,6 @@ def start_and_poll(client: str, pid: str, secret: str, pin: str) -> Tuple[Option
         row = get_profile(client, pid)
         state = (row or {}).get("state", "unknown").lower()
         if state == "active":
-            # state flips to active slightly before addresses are reported;
-            # give the daemon a few seconds to fill them in
             addr_deadline = time.time() + 6
             while time.time() < addr_deadline and (row or {}).get("client_addr", "-") in ("", "-"):
                 time.sleep(1)
@@ -177,6 +595,9 @@ def start_and_poll(client: str, pid: str, secret: str, pin: str) -> Tuple[Option
             return row, ""
         if state == "inactive":
             return None, "rejected"
+    # Timed out mid-connect: clean up the half-open tunnel so it does not
+    # poison the network stack / leave the default route stale.
+    run_client(client, "stop", pid, timeout=15)
     return None, "timeout (still connecting?)"
 
 
@@ -191,7 +612,6 @@ def connect_profile(cfg: Dict[str, Any]) -> Tuple[int, str]:
 
     row, error = start_and_poll(client, pid, cfg["totp_secret"], cfg["pin"])
     if error == "rejected":
-        # TOTP may have expired mid-flight; retry once with a fresh code
         row, error = start_and_poll(client, pid, cfg["totp_secret"], cfg["pin"])
     if row is not None:
         return 0, "connected: {} -> {}".format(row["client_addr"], row["server_addr"])
@@ -203,6 +623,11 @@ def log(message: str) -> None:
     stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
     with open(LOG_PATH, "a", encoding="utf-8") as handle:
         handle.write("[{}] {}\n".format(stamp, message))
+
+
+# States we should NOT try to reconnect from — sleeping machine, daemon busy,
+# or a transitional stop. Touching these caused the post-sleep spam/instability.
+DEFER_STATES = ("active", "connecting", "system", "reconnecting", "exiting", "disconnecting")
 
 
 # ---------------------------------------------------------------------------
@@ -247,11 +672,12 @@ def cmd_status(cfg: Dict[str, Any]) -> int:
     pid = resolve_profile_id(cfg)
     row = get_profile(client, pid)
     if row is None:
-        print("Profile: {}\nState:   not found".format(pid))
+        print("Profile: {}\nState:   not found\nAuto-reconnect: {}".format(pid, "on" if is_enabled() else "off"))
         return 1
     print(
-        "Profile: {} ({})\nState:   {}\nClient:  {}\nServer:  {}".format(
-            row["id"], row["name"], row["state"], row["client_addr"], row["server_addr"]
+        "Profile: {} ({})\nState:   {}\nClient:  {}\nServer:  {}\nAuto-reconnect: {}".format(
+            row["id"], row["name"], row["state"], row["client_addr"], row["server_addr"],
+            "on" if is_enabled() else "off",
         )
     )
     return 0 if row["state"].lower() == "active" else 1
@@ -260,15 +686,36 @@ def cmd_status(cfg: Dict[str, Any]) -> int:
 def cmd_totp(cfg: Dict[str, Any], copy_to_clipboard: bool = False) -> int:
     code, remaining = totp_now(cfg["totp_secret"])
     if copy_to_clipboard:
-        subprocess.run(["/usr/bin/pbcopy"], input=code, text=True, check=False)
+        get_ops().copy_to_clipboard(code)
         print("{} (valid {}s) — copied".format(code, remaining))
     else:
         print("{} (valid {}s)".format(code, remaining))
     return 0
 
 
+def cmd_enable(cfg: Dict[str, Any]) -> int:
+    save_state({**load_state(), "enabled": True})
+    print("auto-reconnect enabled")
+    code, message = connect_profile(cfg)
+    print(message)
+    return code
+
+
+def cmd_disable(cfg: Dict[str, Any]) -> int:
+    save_state({**load_state(), "enabled": False})
+    print("auto-reconnect disabled")
+    return cmd_disconnect(cfg)
+
+
+def cmd_enabled(cfg: Dict[str, Any]) -> int:
+    print("on" if is_enabled() else "off")
+    return 0
+
+
 def cmd_ensure(cfg: Dict[str, Any]) -> int:
-    """Watchdog entry point: connect if not connected. Quiet when all is well."""
+    """One-shot: connect if not connected AND auto-reconnect is enabled."""
+    if not is_enabled():
+        return 0
     client = cfg["pritunl_client"]
     try:
         pid = resolve_profile_id(cfg)
@@ -280,8 +727,11 @@ def cmd_ensure(cfg: Dict[str, Any]) -> int:
         log("ensure: profile {} not found".format(pid))
         return 1
     state = row["state"].lower()
-    if state in ("active", "connecting"):
+    if state in DEFER_STATES:
         return 0
+    if not get_ops().internet_ok():
+        log("ensure: no internet reachability; deferring")
+        return 1
     log("ensure: state={} -> connecting {}".format(state, pid))
     code, message = connect_profile(cfg)
     log("ensure: " + message)
@@ -289,24 +739,51 @@ def cmd_ensure(cfg: Dict[str, Any]) -> int:
 
 
 def cmd_daemon(cfg: Dict[str, Any]) -> int:
-    """Persistent watchdog loop (run under launchd KeepAlive).
+    """Persistent watchdog loop (run under the service manager).
 
-    Polls every WATCHDOG_INTERVAL seconds and reconnects when the profile is
-    down. Never exits on errors (launchd would just restart it); logs only
-    state transitions.
+    Sleep-safe: does not fight the OS while asleep (``system``) or while the
+    daemon is mid-transition, verifies internet reachability before dialing,
+    and only (optionally) resets Wi-Fi after repeated post-wake failures.
     """
     client = cfg["pritunl_client"]
-    log("daemon started (interval {}s)".format(WATCHDOG_INTERVAL))
+    ops = get_ops()
+    log("daemon started (platform {} interval {}s)".format(ops.name, WATCHDOG_INTERVAL))
+    last_wall = time.time()
+    down_checks = 0
     while True:
         try:
+            # Wake detection: if wall time jumped well beyond the poll interval,
+            # the machine just woke — let macOS/Linux finish Wi-Fi/DNS.
+            now = time.time()
+            if now - last_wall > WATCHDOG_INTERVAL * 4:
+                log("daemon: wake detected; settling {}s".format(WAKE_SETTLE_SECONDS))
+                down_checks = 0
+                time.sleep(WAKE_SETTLE_SECONDS)
+            last_wall = now
+
+            if not is_enabled():
+                time.sleep(WATCHDOG_INTERVAL)
+                continue
+
             pid = resolve_profile_id(cfg)
             row = get_profile(client, pid)
             state = (row or {}).get("state", "unknown").lower() if row else "missing"
-            if state in ("active", "connecting"):
-                pass
-            elif state == "missing":
+
+            if state == "missing":
                 log("daemon: profile {} not found".format(pid))
+            elif state in DEFER_STATES:
+                # connected, connecting, or asleep — leave it alone
+                down_checks = 0
             else:
+                down_checks += 1
+                if not ops.internet_ok():
+                    log("daemon: state={} but no internet; deferring".format(state))
+                    if cfg.get("auto_wifi_reset") and down_checks >= WIFI_RESET_AFTER_FAILS:
+                        code, msg = ops.wifi_reset()
+                        log("daemon: wifi reset ({}) -> {}".format("ok" if code == 0 else "fail", msg))
+                        down_checks = 0
+                    time.sleep(WATCHDOG_INTERVAL * 2)
+                    continue
                 log("daemon: state={} -> connecting {}".format(state, pid))
                 code, message = connect_profile(cfg)
                 log("daemon: " + message)
@@ -317,58 +794,40 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
         time.sleep(WATCHDOG_INTERVAL)
 
 
-PLIST_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/usr/bin/python3</string>
-        <string>{script}</string>
-        <string>daemon</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>ProcessType</key>
-    <string>Interactive</string>
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-    <key>StandardOutPath</key>
-    <string>{log}</string>
-    <key>StandardErrorPath</key>
-    <string>{log}</string>
-</dict>
-</plist>
-"""
+def cmd_diag(cfg: Dict[str, Any]) -> int:
+    ops = get_ops()
+    print("=== vpn diagnostics ({}) ===".format(ops.name))
+    pid = resolve_profile_id(cfg)
+    row = get_profile(cfg["pritunl_client"], pid)
+    state = (row or {}).get("state", "missing")
+    print("profile : {} ({})".format(pid, cfg.get("profile_id", "auto-detected")))
+    print("state   : {}".format(state))
+    print("client  : {}".format((row or {}).get("client_addr", "-")))
+    print("server  : {}".format((row or {}).get("server_addr", "-")))
+    print("internet: {}".format("ok" if ops.internet_ok() else "UNREACHABLE"))
+    reset_tool = ("nmcli" if shutil.which("nmcli") else
+                  "rfkill" if shutil.which("rfkill") else
+                  "networksetup" if IS_MAC else "none")
+    print("wifi    : reset tool={} auto_reset={}".format(
+        reset_tool, "on" if cfg.get("auto_wifi_reset") else "off"))
+    print("\n--- default route ---\n{}".format(ops.default_route().strip()))
+    print("\n--- DNS ---\n{}".format(ops.dns_servers().strip()))
+    if state.lower() != "active":
+        log("diag: state={} internet={}".format(state, "ok" if ops.internet_ok() else "no"))
+    return 0
 
 
-def cmd_install() -> int:
+def cmd_install(cfg: Dict[str, Any] = None, with_tray: bool = False) -> int:  # type: ignore[assignment]
     script = Path(__file__).resolve()
-    plist = PLIST_TEMPLATE.format(
-        label=PLIST_LABEL,
-        script=script,
-        log=LOG_PATH,
-    )
-    PLIST_PATH.write_text(plist, encoding="utf-8")
-    uid = os.getuid()
-    subprocess.run(
-        ["/bin/launchctl", "bootout", "gui/{}/{}".format(uid, PLIST_LABEL)],
-        capture_output=True,
-        check=False,
-    )
-    result = subprocess.run(
-        ["/bin/launchctl", "bootstrap", "gui/{}".format(uid), str(PLIST_PATH)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        print("launchctl bootstrap failed: " + (result.stderr or result.stdout).strip())
-        return 1
+    python = Path(sys.executable)
+    ops = get_ops()
+    code, msg = ops.install_service(script, python, LOG_PATH)
+    if code != 0:
+        print("service install failed: " + msg)
+        return code
+    print("Installed service: {} ({})".format(SERVICE_LABEL, msg))
+    print("  - starts at login, stays running, watchdog reconnects within ~{}s".format(WATCHDOG_INTERVAL + 10))
+    print("  - log: {}".format(LOG_PATH))
 
     bin_dir = HOME / ".local" / "bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
@@ -376,50 +835,47 @@ def cmd_install() -> int:
     if link.is_symlink() or link.exists():
         link.unlink()
     link.symlink_to(script)
-
-    print("Installed LaunchAgent: {}".format(PLIST_PATH))
-    print("  - starts at login (RunAtLoad) and stays running (KeepAlive)")
-    print("  - watchdog loop reconnects within ~{}s of a drop or wake from sleep".format(WATCHDOG_INTERVAL + 10))
-    print("  - log: {}".format(LOG_PATH))
     print("CLI symlink: {} -> {}".format(link, script))
-    return 0
+
+    if with_tray:
+        tcode, tmsg = ops.install_tray(script, python)
+        print("Tray: {} ({})".format("installed" if tcode == 0 else "FAILED", tmsg))
+    return code
 
 
 def cmd_uninstall() -> int:
-    uid = os.getuid()
-    for label in (PLIST_LABEL, "com.local.vpn-connector"):
-        subprocess.run(
-            ["/bin/launchctl", "bootout", "gui/{}/{}".format(uid, label)],
-            capture_output=True,
-            check=False,
-        )
-        stale = HOME / "Library" / "LaunchAgents" / (label + ".plist")
-        if stale.exists():
-            stale.unlink()
+    ops = get_ops()
+    ops.uninstall_service()
+    ops.uninstall_tray()
     link = HOME / ".local" / "bin" / "vpn"
     if link.is_symlink():
         link.unlink()
-    print("Removed LaunchAgent and symlink")
+    print("Removed service, tray unit, and symlink")
     return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="vpn", description="Lightweight Pritunl VPN client with TOTP")
+    parser = argparse.ArgumentParser(prog="vpn", description="Cross-platform Pritunl client with TOTP + watchdog")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("connect", help="connect using PIN + TOTP")
     sub.add_parser("disconnect", help="disconnect")
     sub.add_parser("status", help="show profile state (exit 0 = connected)")
     p_totp = sub.add_parser("totp", help="print current TOTP code")
     p_totp.add_argument("--copy", action="store_true", help="also copy code to clipboard")
+    sub.add_parser("enable", help="enable auto-reconnect and connect now")
+    sub.add_parser("disable", help="disable auto-reconnect and disconnect now")
+    sub.add_parser("enabled", help="print whether auto-reconnect is enabled")
     sub.add_parser("ensure", help="connect if not connected (one-shot)")
-    sub.add_parser("daemon", help="run watchdog loop (used by LaunchAgent)")
-    sub.add_parser("install", help="install LaunchAgent (login start + watchdog daemon)")
-    sub.add_parser("uninstall", help="remove LaunchAgent")
+    sub.add_parser("daemon", help="run watchdog loop (used by service manager)")
+    sub.add_parser("diag", help="routing/DNS/reachability diagnostics")
+    p_install = sub.add_parser("install", help="install service manager unit (+ optional --tray)")
+    p_install.add_argument("--tray", action="store_true", help="also install the menu-bar tray app")
+    sub.add_parser("uninstall", help="remove service + tray + symlink")
 
     args = parser.parse_args()
     try:
         if args.command == "install":
-            return cmd_install()
+            return cmd_install(with_tray=args.tray)
         if args.command == "uninstall":
             return cmd_uninstall()
         cfg = load_config()
@@ -431,10 +887,18 @@ def main() -> int:
             return cmd_status(cfg)
         if args.command == "totp":
             return cmd_totp(cfg, copy_to_clipboard=args.copy)
+        if args.command == "enable":
+            return cmd_enable(cfg)
+        if args.command == "disable":
+            return cmd_disable(cfg)
+        if args.command == "enabled":
+            return cmd_enabled(cfg)
         if args.command == "ensure":
             return cmd_ensure(cfg)
         if args.command == "daemon":
             return cmd_daemon(cfg)
+        if args.command == "diag":
+            return cmd_diag(cfg)
     except VPNError as exc:
         print("error: {}".format(exc), file=sys.stderr)
         return 1

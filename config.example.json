@@ -2,5 +2,6 @@
   "profile_id": "",
   "totp_secret": "JBSWY3DPEHPK3PXP",
   "pin": "000000",
-  "pritunl_client": "/Applications/Pritunl.app/Contents/Resources/pritunl-client"
+  "pritunl_client": "",
+  "auto_wifi_reset": false
 }
