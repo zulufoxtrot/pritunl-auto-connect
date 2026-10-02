@@ -13,6 +13,9 @@ diagnostics, and a menu-bar / system-tray controller.
   `state=system -> connecting` / no-internet-after-wake loop), verifies
   internet reachability before dialing, and cleans up half-open tunnels
 - **Enable / disable auto-reconnect** with one command or a tray toggle
+- **Manual disconnect is honored** — clicking Disconnect (or `vpn disconnect`)
+  sets a `user_action=manual_off` intent so the watchdog stays down; the
+  watchdog only reconnects on *unexpected* drops while intent is `auto`
 - **Menu-bar / system-tray** item with status icon + Connect / Disconnect /
   Auto-reconnect / Quit
 - Optional, gated, logged **Wi-Fi power-cycle** if the tunnel cannot come up

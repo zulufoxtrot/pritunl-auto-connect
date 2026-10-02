@@ -108,35 +108,37 @@ def run_linux() -> int:
             d.line([3, ICON_SIZE - 3, ICON_SIZE - 3, 3], fill=(255, 255, 255, 255), width=2)
         return img
 
+    def _bg(fn):
+        # pystray runs callbacks on the UI thread — never block it.
+        threading.Thread(target=fn, daemon=True).start()
+
     def poll(ic):
         while not _should_quit.is_set():
             info = status()
             try:
                 ic.icon = make_icon(info)
                 ic.title = tooltip(info)
-                ic.menu = build_menu(ic)
             except Exception:
                 pass
             time.sleep(POLL)
 
-    def build_menu(ic):
-        info = status()
+    def build_menu():
         return pystray.Menu(
             pystray.MenuItem(
-                lambda item: "Disconnect" if info["state"] == "active" else "Connect",
-                lambda icon, item: (disconnect_info() if status()["state"] == "active" else connect_info()),
+                lambda item: "Disconnect" if status()["state"] == "active" else "Connect",
+                lambda icon, item: _bg(lambda: (disconnect_info() if status()["state"] == "active" else connect_info())),
                 default=True,
             ),
             pystray.MenuItem(
-                lambda item: "Auto-reconnect: {}".format("on" if info["enabled"] else "off"),
-                lambda icon, item: run_vpn("disable" if status()["enabled"] else "enable"),
+                lambda item: "Auto-reconnect: {}".format("on" if status()["enabled"] else "off"),
+                lambda icon, item: _bg(lambda: run_vpn("disable" if status()["enabled"] else "enable")),
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda icon, item: (_should_quit.set(), icon.stop())),
         )
 
     info = status()
-    icon = pystray.Icon("vpn", title=tooltip(info), icon=make_icon(info), menu=build_menu(None))
+    icon = pystray.Icon("vpn", title=tooltip(info), icon=make_icon(info), menu=build_menu())
     threading.Thread(target=poll, args=(icon,), daemon=True).start()
     icon.run()
     return 0
@@ -169,7 +171,9 @@ def run_macos() -> int:
             self.app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
             self.statusbar = NSStatusBar.systemStatusBar()
             self.item = self.statusbar.statusItemWithLength_(NSVariableStatusItemLength)
-            self._refresh()
+            self.info = status()
+            self._render()
+            self._refresh_async()
             self._schedule()
 
         def _icon_for(self, color):
@@ -185,11 +189,11 @@ def run_macos() -> int:
             image.unlockFocus()
             return image
 
-        def _refresh(self):
-            info = status()
+        def _render(self):
+            # Pure UI: runs on the main thread from cached info, never blocks.
+            info = self.info
             self.item.button().setImage_(self._icon_for(color_for(info)))
             self.item.button().setToolTip_(tooltip(info))
-            self._info = info
             menu = NSMenu.alloc().init()
             active = info["state"] == "active"
             connect = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -209,16 +213,34 @@ def run_macos() -> int:
             menu.addItem_(quit_)
             self.item.setMenu_(menu)
 
+        def _do_on_main(self, sel):
+            self.app.performSelectorOnMainThread_withObject_waitUntilDone_(
+                sel, None, False
+            )
+
+        def _refresh_async(self):
+            def bg():
+                self.info = status()
+                self._do_on_main("_render")
+            threading.Thread(target=bg, daemon=True).start()
+
         def toggleConnect_(self, _sender):
-            if status()["state"] == "active":
-                disconnect_info()
-            else:
-                connect_info()
-            self._refresh()
+            want_disconnect = self.info["state"] == "active"
+
+            def bg():
+                (disconnect_info() if want_disconnect else connect_info())
+                self.info = status()
+                self._do_on_main("_render")
+            threading.Thread(target=bg, daemon=True).start()
 
         def toggleAuto_(self, _sender):
-            run_vpn("disable" if status()["enabled"] else "enable")
-            self._refresh()
+            want_off = self.info["enabled"]
+
+            def bg():
+                run_vpn("disable" if want_off else "enable")
+                self.info = status()
+                self._do_on_main("_render")
+            threading.Thread(target=bg, daemon=True).start()
 
         def quit_(self, _sender):
             _should_quit.set()
@@ -227,11 +249,11 @@ def run_macos() -> int:
         def _tick(self, _timer):
             if _should_quit.is_set():
                 return
-            self._refresh()
+            self._refresh_async()
             self._schedule()
 
         def _schedule(self):
-            t = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 POLL, self, "_tick:", None, False
             )
 

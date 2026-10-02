@@ -166,7 +166,12 @@ class MacOSOps(PlatformOps):
         PLIST_PATH.write_text(plist, encoding="utf-8")
         self._launchctl("bootout", "gui/{}/{}".format(os.getuid(), SERVICE_LABEL))
         r = self._launchctl("bootstrap", "gui/{}".format(os.getuid()), str(PLIST_PATH))
-        if r.returncode != 0:
+        if r.returncode == 0:
+            # Restart the daemon so it picks up the new code without a kill-race:
+            # kickstart is SIGTERM-graceful, and save_state is atomic so
+            # enable/disable state can never be torn mid-write.
+            self._launchctl("kickstart", "-k", "gui/{}/{}".format(os.getuid(), SERVICE_LABEL))
+        else:
             return 1, "launchctl bootstrap failed: " + (r.stderr or r.stdout).strip()
         return 0, "installed launchd job {}".format(PLIST_PATH)
 
@@ -464,12 +469,14 @@ def load_state() -> Dict[str, Any]:
             return json.loads(STATE_PATH.read_text(encoding="utf-8"))
         except ValueError:
             pass
-    return {"enabled": True}
+    return {"enabled": True, "user_action": "auto"}
 
 
 def save_state(state: Dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    STATE_PATH.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    os.replace(str(tmp), str(STATE_PATH))  # atomic swap
 
 
 def is_enabled() -> bool:
@@ -636,12 +643,13 @@ DEFER_STATES = ("active", "connecting", "system", "reconnecting", "exiting", "di
 
 
 def cmd_connect(cfg: Dict[str, Any]) -> int:
+    save_state({**load_state(), "user_action": "auto"})
     code, message = connect_profile(cfg)
     print(message)
     return code
 
 
-def cmd_disconnect(cfg: Dict[str, Any]) -> int:
+def _stop_profile(cfg: Dict[str, Any]) -> int:
     client = cfg["pritunl_client"]
     pid = resolve_profile_id(cfg)
     row = get_profile(client, pid)
@@ -667,22 +675,6 @@ def cmd_disconnect(cfg: Dict[str, Any]) -> int:
     return 0 if state == "inactive" else 1
 
 
-def cmd_status(cfg: Dict[str, Any]) -> int:
-    client = cfg["pritunl_client"]
-    pid = resolve_profile_id(cfg)
-    row = get_profile(client, pid)
-    if row is None:
-        print("Profile: {}\nState:   not found\nAuto-reconnect: {}".format(pid, "on" if is_enabled() else "off"))
-        return 1
-    print(
-        "Profile: {} ({})\nState:   {}\nClient:  {}\nServer:  {}\nAuto-reconnect: {}".format(
-            row["id"], row["name"], row["state"], row["client_addr"], row["server_addr"],
-            "on" if is_enabled() else "off",
-        )
-    )
-    return 0 if row["state"].lower() == "active" else 1
-
-
 def cmd_totp(cfg: Dict[str, Any], copy_to_clipboard: bool = False) -> int:
     code, remaining = totp_now(cfg["totp_secret"])
     if copy_to_clipboard:
@@ -693,8 +685,32 @@ def cmd_totp(cfg: Dict[str, Any], copy_to_clipboard: bool = False) -> int:
     return 0
 
 
+def cmd_status(cfg: Dict[str, Any]) -> int:
+    client = cfg["pritunl_client"]
+    pid = resolve_profile_id(cfg)
+    row = get_profile(client, pid)
+    enabled = is_enabled()
+    auto = "on" if enabled else "off"
+    if row is None:
+        print("Profile: {}\nState:   not found\nAuto-reconnect: {}".format(pid, auto))
+        return 1
+    print(
+        "Profile: {} ({})\nState:   {}\nClient:  {}\nServer:  {}\nAuto-reconnect: {}".format(
+            row["id"], row["name"], row["state"], row["client_addr"], row["server_addr"], auto
+        )
+    )
+    return 0 if row["state"].lower() == "active" else 1
+
+
+def cmd_disconnect(cfg: Dict[str, Any]) -> int:
+    # Set the *intent* before stopping so the watchdog never reconnects a
+    # deliberate disconnect (it checks user_action every pass).
+    save_state({**load_state(), "user_action": "manual_off"})
+    return _stop_profile(cfg)
+
+
 def cmd_enable(cfg: Dict[str, Any]) -> int:
-    save_state({**load_state(), "enabled": True})
+    save_state({**load_state(), "enabled": True, "user_action": "auto"})
     print("auto-reconnect enabled")
     code, message = connect_profile(cfg)
     print(message)
@@ -702,9 +718,9 @@ def cmd_enable(cfg: Dict[str, Any]) -> int:
 
 
 def cmd_disable(cfg: Dict[str, Any]) -> int:
-    save_state({**load_state(), "enabled": False})
+    save_state({**load_state(), "enabled": False, "user_action": "manual_off"})
     print("auto-reconnect disabled")
-    return cmd_disconnect(cfg)
+    return _stop_profile(cfg)
 
 
 def cmd_enabled(cfg: Dict[str, Any]) -> int:
@@ -750,6 +766,8 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
     log("daemon started (platform {} interval {}s)".format(ops.name, WATCHDOG_INTERVAL))
     last_wall = time.time()
     down_checks = 0
+    was_up = False  # whether we last saw the tunnel connected (drop detection)
+    action = "auto"
     while True:
         try:
             # Wake detection: if wall time jumped well beyond the poll interval,
@@ -761,7 +779,15 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
                 time.sleep(WAKE_SETTLE_SECONDS)
             last_wall = now
 
-            if not is_enabled():
+            # Single source of truth: user intent from state.json.
+            st = load_state()
+            action = st.get("user_action", "auto")
+            enabled = bool(st.get("enabled", True))
+
+            if not enabled or action == "manual_off":
+                # Disabled by user, or deliberately disconnected — stay down.
+                was_up = False
+                down_checks = 0
                 time.sleep(WATCHDOG_INTERVAL)
                 continue
 
@@ -771,10 +797,14 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
 
             if state == "missing":
                 log("daemon: profile {} not found".format(pid))
+                was_up = False
             elif state in DEFER_STATES:
-                # connected, connecting, or asleep — leave it alone
+                # connected, connecting, or asleep — remember the up/down edge
+                was_up = state in ("active", "connecting")
                 down_checks = 0
-            else:
+            elif was_up:
+                # Unexpected drop from an up state while intent is 'auto'.
+                was_up = False
                 down_checks += 1
                 if not ops.internet_ok():
                     log("daemon: state={} but no internet; deferring".format(state))
@@ -789,6 +819,10 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
                 log("daemon: " + message)
                 if code != 0:
                     time.sleep(WATCHDOG_INTERVAL * 3)
+            else:
+                # Already down, intent auto, but we never saw it up this
+                # session — leave it; the tray/CLI is in control.
+                down_checks = 0
         except Exception as exc:  # never die
             log("daemon error: {!r}".format(exc))
         time.sleep(WATCHDOG_INTERVAL)
