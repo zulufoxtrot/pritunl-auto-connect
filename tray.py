@@ -69,8 +69,10 @@ def make_overlay_image(base, color, enabled: bool = True):
     d = ImageDraw.Draw(img)
     scale = RENDER / float(ICON_SIZE)
     dot = int(DOT * scale)
-    m = int(4 * scale)
-    d.ellipse([m, m, m + dot, m + dot], fill=color + (255,),
+    m = int(1 * scale)                      # small margin from the edge
+    x1 = RENDER - dot - m                   # top-right placement
+    y1 = m
+    d.ellipse([x1, y1, x1 + dot, y1 + dot], fill=color + (255,),
               outline=(255, 255, 255, 255), width=max(1, int(2 * scale)))
     if not enabled:
         d.line([m, RENDER - m, RENDER - m, m], fill=(255, 255, 255, 255),
@@ -89,15 +91,18 @@ def render_icon_png(color, enabled: bool = True) -> bytes:
         from AppKit import NSBezierPath, NSColor, NSMakePoint, NSMakeRect, NSImage
         image = NSImage.alloc().initWithSize_((ICON_SIZE, ICON_SIZE))
         image.lockFocus()
+        # NSImage origin is bottom-left; top-right = high x, high y.
         NSColor.colorWithSRGBRed_green_blue_alpha_(
             color[0] / 255.0, color[1] / 255.0, color[2] / 255.0, 1.0
         ).setFill()
-        NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(4, 4, DOT, DOT)).fill()
+        NSBezierPath.bezierPathWithOvalInRect_(
+            NSMakeRect(ICON_SIZE - DOT - 1, ICON_SIZE - DOT - 1, DOT, DOT)
+        ).fill()
         if not enabled:
             NSColor.whiteColor().setStroke()
             p = NSBezierPath.bezierPath()
-            p.moveToPoint_(NSMakePoint(4, ICON_SIZE - 4))
-            p.lineToPoint_(NSMakePoint(ICON_SIZE - 4, 4))
+            p.moveToPoint_(NSMakePoint(1, 1))
+            p.lineToPoint_(NSMakePoint(ICON_SIZE - 1, ICON_SIZE - 1))
             p.setLineWidth_(2.0)
             p.stroke()
         image.unlockFocus()
