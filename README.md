@@ -1,5 +1,9 @@
 # pritunl-auto-reconnect
 
+<p align="center">
+  <img src="docs/tray.png" alt="Tray screenshot" width="55%" style="border-radius:14px"/>
+</p>
+
 Using Pritunl with a VPN that does not allow auto-reconnect and has TOTP
 auth? Tired of re-typing the OTP every time your laptop sleeps?
 
@@ -7,8 +11,6 @@ This app reconnects you automatically. You set the TOTP seed the first time,
 then you can forget about it.
 
 Works on Linux, in theory, and macOS.
-
-![Tray screenshot](docs/tray.png)
 
 ## What it does
 
