@@ -17,7 +17,7 @@ diagnostics, and a menu-bar / system-tray controller.
   sets a `user_action=manual_off` intent so the watchdog stays down; the
   watchdog only reconnects on *unexpected* drops while intent is `auto`
 - **Menu-bar / system-tray** item with status icon + Connect / Disconnect /
-  Auto-reconnect / Quit
+  Auto-reconnect / About / Quit (About shows the author and repo link)
 - Optional, gated, logged **Wi-Fi power-cycle** if the tunnel cannot come up
   after repeated post-wake failures (off by default)
 

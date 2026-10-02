@@ -17,6 +17,7 @@ Backends:
 
 import io
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -27,6 +28,11 @@ IS_MAC = sys.platform == "darwin"
 
 HERE = Path(__file__).resolve().parent
 VPN = str(HERE / "vpn")
+
+APP_NAME = "Pritunl Auto-Reconnect"
+AUTHOR = "zulufoxtrot"
+REPO_URL = "https://github.com/zulufoxtrot/pritunl-auto-connect"
+ABOUT_TEXT = "{}\n\nAuthor: {}\nRepo: {}".format(APP_NAME, AUTHOR, REPO_URL)
 
 GREEN = (46, 204, 113)
 RED = (231, 76, 60)
@@ -170,6 +176,17 @@ def disconnect_info() -> None:
     run_vpn("disconnect")
 
 
+def show_about_dialog() -> None:
+    """Linux about dialog via zenity/kdialog (falls back to stdout)."""
+    if shutil.which("zenity"):
+        subprocess.run(["zenity", "--info", "--title", APP_NAME, "--text", ABOUT_TEXT], check=False)
+        return
+    if shutil.which("kdialog"):
+        subprocess.run(["kdialog", "--title", APP_NAME, "--msgbox", ABOUT_TEXT], check=False)
+        return
+    print(ABOUT_TEXT)
+
+
 # ---------------------------------------------------------------------------
 # Linux backend: pystray + Pillow
 # ---------------------------------------------------------------------------
@@ -209,6 +226,8 @@ def run_linux() -> int:
                 lambda icon, item: _bg(lambda: run_vpn("disable" if status()["enabled"] else "enable")),
             ),
             pystray.Menu.SEPARATOR,
+            pystray.MenuItem("About…", lambda icon, item: _bg(show_about_dialog)),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", lambda icon, item: (_should_quit.set(), icon.stop())),
         )
 
@@ -227,7 +246,7 @@ def run_linux() -> int:
 def run_macos() -> int:
     import objc  # noqa: F401  (ensures PyObjC bridges are installed)
     import queue
-    from Foundation import NSObject
+    from Foundation import NSObject, NSAutoreleasePool
     from AppKit import (
         NSApplication,
         NSApplicationActivationPolicyAccessory,
@@ -238,6 +257,9 @@ def run_macos() -> int:
         NSMenuItem,
         NSStatusBar,
         NSVariableStatusItemLength,
+        NSAlert,
+        NSWorkspace,
+        NSURL,
     )
 
     # This Python/PyObjC build never delivers NSTimer callbacks nor
@@ -292,6 +314,15 @@ def run_macos() -> int:
                 updates.put(status())
             threading.Thread(target=job, daemon=True).start()
 
+        def about_(self, _sender):
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_(APP_NAME)
+            alert.setInformativeText_("Author: {}\nRepo: {}".format(AUTHOR, REPO_URL))
+            alert.addButtonWithTitle_("Open Repo")
+            alert.addButtonWithTitle_("Close")
+            if alert.runModal() == 1000:  # NSAlertFirstButtonReturn
+                NSWorkspace.sharedWorkspace().openURL_(NSURL.URLWithString_(REPO_URL))
+
         def quit_(self, _sender):
             stop.set()
 
@@ -314,6 +345,12 @@ def run_macos() -> int:
         auto.setTarget_(controller)
         menu.addItem_(auto)
         menu.addItem_(NSMenuItem.separatorItem())
+        about = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "About…", "about:", ""
+        )
+        about.setTarget_(controller)
+        menu.addItem_(about)
+        menu.addItem_(NSMenuItem.separatorItem())
         quit_ = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "quit:", "q")
         quit_.setTarget_(controller)
         menu.addItem_(quit_)
@@ -331,20 +368,27 @@ def run_macos() -> int:
 
     threading.Thread(target=poll_worker, daemon=True).start()
 
-    # Main-thread event pump: apply queued updates, then process AppKit events.
+    # Main-thread event pump: apply queued updates, then process AppKit
+    # events. Each iteration gets its own autorelease pool so the AppKit
+    # objects created per tick (NSDate/NSEvent/NSImage/NSMenu) are drained
+    # instead of accumulating over days of runtime.
     while not stop.is_set() and not _should_quit.is_set():
+        pool = NSAutoreleasePool.alloc().init()
         try:
-            while True:
-                state["info"] = updates.get_nowait()
-                apply_info(state["info"])
-        except queue.Empty:
-            pass
-        event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
-            0xFFFFFFFF, NSDate.dateWithTimeIntervalSinceNow_(0.2),
-            NSDefaultRunLoopMode, True,
-        )
-        if event is not None:
-            app.sendEvent_(event)
+            try:
+                while True:
+                    state["info"] = updates.get_nowait()
+                    apply_info(state["info"])
+            except queue.Empty:
+                pass
+            event = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                0xFFFFFFFF, NSDate.dateWithTimeIntervalSinceNow_(0.2),
+                NSDefaultRunLoopMode, True,
+            )
+            if event is not None:
+                app.sendEvent_(event)
+        finally:
+            pool.drain()
     return 0
 
 

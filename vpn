@@ -46,6 +46,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -137,14 +138,22 @@ class PlatformOps:
         raise NotImplementedError
 
     def internet_ok(self) -> bool:
-        # 1.1.1.1:53 is a reliable, DNS-free reachability probe. macOS ping
-        # takes deadline as -t (seconds); Linux takes timeout as -W (seconds).
+        # Prefer a TCP probe (works even where outbound ICMP is blocked),
+        # then fall back to ICMP ping.
+        try:
+            import socket
+            sock = socket.create_connection(("1.1.1.1", 443), timeout=2)
+            sock.close()
+            return True
+        except Exception:
+            pass
+        ping = shutil.which("ping") or "ping"
         if IS_MAC:
-            cmd = ["/sbin/ping", "-c", "1", "-t", "3", "1.1.1.1"]
+            cmd = [ping, "-c", "1", "-t", "3", "1.1.1.1"]
         elif IS_LINUX:
-            cmd = ["/bin/ping", "-c", "1", "-W", "2", "1.1.1.1"]
+            cmd = [ping, "-c", "1", "-W", "2", "1.1.1.1"]
         else:
-            cmd = ["ping", "-c", "1", "1.1.1.1"]
+            cmd = [ping, "-c", "1", "1.1.1.1"]
         try:
             r = subprocess.run(cmd, capture_output=True, timeout=5)
             return r.returncode == 0
@@ -227,11 +236,13 @@ class MacOSOps(PlatformOps):
         if not iface:
             return 1, "no AirPort/Wi-Fi interface found"
         try:
-            subprocess.run(["/usr/sbin/networksetup", "-setairportpower", iface, "off"],
-                           check=False, timeout=15)
+            off = subprocess.run(["/usr/sbin/networksetup", "-setairportpower", iface, "off"],
+                                 capture_output=True, text=True, timeout=15)
             time.sleep(3)
-            subprocess.run(["/usr/sbin/networksetup", "-setairportpower", iface, "on"],
-                           check=False, timeout=15)
+            on = subprocess.run(["/usr/sbin/networksetup", "-setairportpower", iface, "on"],
+                                capture_output=True, text=True, timeout=15)
+            if off.returncode != 0 or on.returncode != 0:
+                return 1, "networksetup failed: " + (off.stderr or on.stderr).strip()
             return 0, "Wi-Fi ({}) power-cycled".format(iface)
         except Exception as exc:
             return 1, "Wi-Fi reset failed: {!r}".format(exc)
@@ -276,8 +287,10 @@ class LinuxOps(PlatformOps):
         return 0
 
     def install_tray(self, script: Path, python: Path) -> Tuple[int, str]:
+        # The tray lives in tray.py, a sibling of the vpn script.
+        tray_script = script.parent / "tray.py"
         # systemd user unit for the tray (so it stays running).
-        self._write_unit(TRAY_LABEL, script, python, LOG_PATH, extra_exec=["tray"])
+        self._write_unit(TRAY_LABEL, tray_script, python, LOG_PATH)
         self._systemctl("daemon-reload")
         r = self._systemctl("enable", "--now", TRAY_LABEL + ".service")
         # Also drop an autostart .desktop entry for desktop sessions.
@@ -285,7 +298,7 @@ class LinuxOps(PlatformOps):
         autostart.mkdir(parents=True, exist_ok=True)
         (autostart / (TRAY_LABEL + ".desktop")).write_text(
             LINUX_AUTOSTART_TEMPLATE.format(
-                label=TRAY_LABEL, python=python, script=script
+                label=TRAY_LABEL, python=python, script=tray_script
             ),
             encoding="utf-8",
         )
@@ -345,17 +358,25 @@ class LinuxOps(PlatformOps):
         # Ubuntu LTS ships NetworkManager; nmcli is the correct toggle.
         if shutil.which("nmcli"):
             try:
-                subprocess.run(["nmcli", "radio", "wifi", "off"], check=False, timeout=15)
+                off = subprocess.run(["nmcli", "radio", "wifi", "off"], capture_output=True,
+                                     text=True, timeout=15)
                 time.sleep(3)
-                subprocess.run(["nmcli", "radio", "wifi", "on"], check=False, timeout=15)
+                on = subprocess.run(["nmcli", "radio", "wifi", "on"], capture_output=True,
+                                    text=True, timeout=15)
+                if off.returncode != 0 or on.returncode != 0:
+                    return 1, "nmcli failed: " + (off.stderr or on.stderr).strip()
                 return 0, "Wi-Fi radio toggled via nmcli"
             except Exception as exc:
                 return 1, "nmcli wifi reset failed: {!r}".format(exc)
         if shutil.which("rfkill"):
             try:
-                subprocess.run(["rfkill", "block", "wifi"], check=False, timeout=15)
+                off = subprocess.run(["rfkill", "block", "wifi"], capture_output=True,
+                                     text=True, timeout=15)
                 time.sleep(3)
-                subprocess.run(["rfkill", "unblock", "wifi"], check=False, timeout=15)
+                on = subprocess.run(["rfkill", "unblock", "wifi"], capture_output=True,
+                                    text=True, timeout=15)
+                if off.returncode != 0 or on.returncode != 0:
+                    return 1, "rfkill failed: " + (off.stderr or on.stderr).strip()
                 return 0, "Wi-Fi radio toggled via rfkill"
             except Exception as exc:
                 return 1, "rfkill wifi reset failed: {!r}".format(exc)
@@ -435,7 +456,7 @@ WantedBy=default.target
 LINUX_AUTOSTART_TEMPLATE = """[Desktop Entry]
 Type=Application
 Name=Pritunl Auto-Reconnect Tray
-Exec={python} {script} tray
+Exec={python} {script}
 X-GNOME-Autostart-enabled=true
 Hidden=false
 """
@@ -466,7 +487,9 @@ def load_config() -> Dict[str, Any]:
 def load_state() -> Dict[str, Any]:
     if STATE_PATH.exists():
         try:
-            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            data = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
         except ValueError:
             pass
     return {"enabled": True, "user_action": "auto"}
@@ -474,9 +497,18 @@ def load_state() -> Dict[str, Any]:
 
 def save_state(state: Dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
-    os.replace(str(tmp), str(STATE_PATH))  # atomic swap
+    # Unique temp name so concurrent writers cannot clobber each other.
+    fd, tmp = tempfile.mkstemp(dir=str(STATE_PATH.parent), prefix="state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(state, indent=2) + "\n")
+        os.replace(tmp, str(STATE_PATH))  # atomic swap
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def is_enabled() -> bool:
@@ -489,7 +521,8 @@ def is_enabled() -> bool:
 
 
 def totp_now(secret: str) -> Tuple[str, int]:
-    key = base64.b32decode(secret.replace(" ", "").upper() + "=" * (-len(secret) % 8), casefold=True)
+    s = secret.replace(" ", "").upper()
+    key = base64.b32decode(s + "=" * (-len(s) % 8), casefold=True)
     counter = int(time.time()) // 30
     digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
     offset = digest[-1] & 0x0F
@@ -766,8 +799,6 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
     log("daemon started (platform {} interval {}s)".format(ops.name, WATCHDOG_INTERVAL))
     last_wall = time.time()
     down_checks = 0
-    was_up = False  # whether we last saw the tunnel connected (drop detection)
-    action = "auto"
     while True:
         try:
             # Wake detection: if wall time jumped well beyond the poll interval,
@@ -786,7 +817,6 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
 
             if not enabled or action == "manual_off":
                 # Disabled by user, or deliberately disconnected — stay down.
-                was_up = False
                 down_checks = 0
                 time.sleep(WATCHDOG_INTERVAL)
                 continue
@@ -797,16 +827,20 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
 
             if state == "missing":
                 log("daemon: profile {} not found".format(pid))
-                was_up = False
             elif state in DEFER_STATES:
-                # connected, connecting, or asleep — remember the up/down edge
-                was_up = state in ("active", "connecting")
+                # connected, connecting, or asleep — leave it alone
                 down_checks = 0
-            elif was_up:
-                # Unexpected drop from an up state while intent is 'auto'.
-                was_up = False
-                down_checks += 1
+            else:
+                # Down while enabled + auto: reconnect. This covers an
+                # unexpected drop, a failed earlier attempt, and a tunnel that
+                # was already down when the daemon started.
+                st2 = load_state()
+                if not st2.get("enabled", True) or st2.get("user_action", "auto") == "manual_off":
+                    down_checks = 0
+                    time.sleep(WATCHDOG_INTERVAL)
+                    continue
                 if not ops.internet_ok():
+                    down_checks += 1
                     log("daemon: state={} but no internet; deferring".format(state))
                     if cfg.get("auto_wifi_reset") and down_checks >= WIFI_RESET_AFTER_FAILS:
                         code, msg = ops.wifi_reset()
@@ -814,15 +848,18 @@ def cmd_daemon(cfg: Dict[str, Any]) -> int:
                         down_checks = 0
                     time.sleep(WATCHDOG_INTERVAL * 2)
                     continue
+                down_checks += 1
                 log("daemon: state={} -> connecting {}".format(state, pid))
                 code, message = connect_profile(cfg)
                 log("daemon: " + message)
                 if code != 0:
-                    time.sleep(WATCHDOG_INTERVAL * 3)
-            else:
-                # Already down, intent auto, but we never saw it up this
-                # session — leave it; the tray/CLI is in control.
-                down_checks = 0
+                    # If the user disconnected while we were dialing, undo it.
+                    st3 = load_state()
+                    if not st3.get("enabled", True) or st3.get("user_action", "auto") == "manual_off":
+                        _stop_profile(cfg)
+                        down_checks = 0
+                    else:
+                        time.sleep(WATCHDOG_INTERVAL * 3)
         except Exception as exc:  # never die
             log("daemon error: {!r}".format(exc))
         time.sleep(WATCHDOG_INTERVAL)
