@@ -1,8 +1,14 @@
 # pritunl-auto-reconnect
 
-A simple `vpn` command for macOS and Linux. It connects your Pritunl profile
-with auto-generated TOTP codes. A watchdog keeps the tunnel up after sleep or
-drops. It also offers diagnostics and a menu-bar tray controller.
+Using Pritunl with a VPN that does not allow auto-reconnect and has TOTP
+auth? Tired of re-typing the OTP every time your laptop sleeps?
+
+This app reconnects you automatically. You set the TOTP seed the first time,
+then you can forget about it.
+
+Works on Linux, in theory, and macOS.
+
+![Tray screenshot](docs/tray.png)
 
 ## What it does
 
