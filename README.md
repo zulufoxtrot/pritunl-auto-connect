@@ -1,40 +1,38 @@
 # pritunl-auto-reconnect
 
-`vpn` — lightweight, **cross-platform** (macOS + Linux) Pritunl client wrapper
-with automatic TOTP, a sleep-safe watchdog, an enable/disable switch,
-diagnostics, and a menu-bar / system-tray controller.
+A simple `vpn` command for macOS and Linux. It connects your Pritunl profile
+with auto-generated TOTP codes. A watchdog keeps the tunnel up after sleep or
+drops. It also offers diagnostics and a menu-bar tray controller.
 
 ## What it does
 
-- Connects your Pritunl profile using PIN + TOTP (RFC 6238, auto-generated,
-  retried with a fresh code if rejected mid-flight)
-- **Sleep-safe watchdog** — reconnects within ~15s of a drop, but does **not**
-  fight the OS while asleep or mid-transition (fixes the old
-  `state=system -> connecting` / no-internet-after-wake loop), verifies
-  internet reachability before dialing, and cleans up half-open tunnels
-- **Enable / disable auto-reconnect** with one command or a tray toggle
-- **Manual disconnect is honored** — clicking Disconnect (or `vpn disconnect`)
-  sets a `user_action=manual_off` intent so the watchdog stays down; the
-  watchdog only reconnects on *unexpected* drops while intent is `auto`
-- **Menu-bar / system-tray** item with status icon + Connect / Disconnect /
-  Auto-reconnect / About / Quit (About shows the author and repo link)
-- Optional, gated, logged **Wi-Fi power-cycle** if the tunnel cannot come up
-  after repeated post-wake failures (off by default)
+- Connects your Pritunl profile using your PIN plus a TOTP code.
+  If the server rejects the code, it retries with a fresh one.
+- Reconnects within about 15 seconds of an unexpected drop.
+  It stays quiet while the machine sleeps or the tunnel is already working.
+  It checks internet reachability before dialing.
+- Lets you turn auto-reconnect on and off with one command or a tray toggle.
+- Honors manual disconnect. When you click Disconnect, the watchdog stays
+  down. It only reconnects on unexpected drops.
+- Shows a menu-bar or system-tray icon. The menu has Connect, Disconnect,
+  Auto-reconnect, About, and Quit. About shows the author and repo link.
+- Can optionally power-cycle Wi-Fi if the tunnel fails repeatedly after wake.
+  This is off by default and every attempt is logged.
 
 ## Supported platforms
 
-- **macOS** — launchd LaunchAgents (`daemon` + optional `tray`), native
-  `NSStatusItem` menu-bar icon
-- **Linux / Ubuntu LTS** — systemd user units (`daemon` + optional `tray`)
-  plus an autostart `.desktop` entry, tray via `pystray` (GTK/AppIndicator)
+- macOS. Uses launchd LaunchAgents and a native NSStatusItem icon.
+- Linux and Ubuntu LTS. Uses systemd user units plus an autostart entry.
+  The tray uses pystray with GTK or AppIndicator.
 
 ## Setup
 
-1. Install the [Pritunl client](https://client.pritunl.com/) and import your
-   profile (verify with `pritunl-client list`).
+1. Install the Pritunl client and import your profile.
+   Confirm it with `pritunl-client list`.
 
-2. Create the config with your base32 TOTP secret (from Pritunl's OTP/2FA
-   enrollment — the secret encoded in the QR code):
+2. Create the config file with your base32 TOTP secret.
+   You get this secret from Pritunl OTP enrollment. It is the value encoded
+   in the QR code.
 
    ```sh
    mkdir -p ~/.config/vpn-connector
@@ -43,17 +41,17 @@ diagnostics, and a menu-bar / system-tray controller.
    chmod 600 ~/.config/vpn-connector/config.json
    ```
 
-   Only `totp_secret` is required. `profile_id` is auto-detected when exactly
-   one profile is registered; `pritunl_client` is auto-detected via
-   `shutil.which`; `pin` is optional; `auto_wifi_reset` defaults to `false`.
+   Only `totp_secret` is required. `profile_id` is found automatically when
+   one profile is registered. `pritunl_client` is found automatically.
+   `pin` is optional. `auto_wifi_reset` defaults to false.
 
-3. Install the tray dependencies (optional, only needed for the menu-bar UI):
+3. Install the tray dependencies. You only need this for the menu-bar UI.
 
    ```sh
    python3 -m pip install -r requirements.txt
    ```
 
-4. Install the service (add `--tray` for the menu-bar / tray app):
+4. Install the service. Add `--tray` to also install the tray app.
 
    ```sh
    ./vpn install --tray
@@ -61,40 +59,44 @@ diagnostics, and a menu-bar / system-tray controller.
 
 ## Commands
 
-| Command             | Effect                                                     |
-|-------------------|------------------------------------------------------------|
-| `vpn connect`     | Connect using PIN + TOTP                                    |
-| `vpn disconnect`  | Disconnect                                                  |
-| `vpn status`      | Show profile state + auto-reconnect (exit 0 = connected)    |
-| `vpn totp`        | Print current TOTP code (`--copy` → clipboard)              |
-| `vpn enable`      | Enable auto-reconnect and connect now                       |
-| `vpn disable`     | Disable auto-reconnect and disconnect now                   |
-| `vpn enabled`     | Print whether auto-reconnect is on/off                      |
-| `vpn ensure`      | One-shot: connect if not connected and enabled              |
-| `vpn daemon`      | Watchdog loop (used by the service manager)                 |
-| `vpn diag`        | Routing / DNS / reachability diagnostics                    |
-| `vpn install`     | Install service unit (+ `--tray`)                           |
-| `vpn uninstall`   | Remove service, tray, and symlink                           |
+| Command            | Effect                                         |
+|------------------|------------------------------------------------|
+| `vpn connect`    | Connect using PIN plus TOTP                    |
+| `vpn disconnect` | Disconnect                                     |
+| `vpn status`     | Show state and auto-reconnect. Exit 0 if connected. |
+| `vpn totp`       | Print the current TOTP code. `--copy` sends it to the clipboard. |
+| `vpn enable`     | Enable auto-reconnect and connect now        |
+| `vpn disable`    | Disable auto-reconnect and disconnect now    |
+| `vpn enabled`    | Print whether auto-reconnect is on or off    |
+| `vpn ensure`     | Connect if not connected and enabled         |
+| `vpn daemon`     | Run the watchdog loop. Used by the service manager. |
+| `vpn diag`       | Show routing, DNS, and reachability diagnostics |
+| `vpn install`    | Install the service unit. `--tray` adds the tray. |
+| `vpn uninstall`  | Remove the service, tray, and symlink        |
 
 ## Files
 
-- Config: `~/.config/vpn-connector/config.json` (0600) — see `config.example.json`
-- Runtime state: `~/.config/vpn-connector/state.json` (`{"enabled": true}`)
-- macOS units: `~/Library/LaunchAgents/com.local.vpn-{daemon,tray}.plist`
-- Linux units: `~/.config/systemd/user/pritunl-auto-reconnect{,-tray}.service`
-  + autostart `~/.config/autostart/pritunl-auto-reconnect-tray.desktop`
-- Log: macOS `~/Library/Logs/vpn-connector.log` · Linux `~/.local/state/vpn-connector.log`
+- Config: `~/.config/vpn-connector/config.json`. Mode 0600.
+  See `config.example.json`.
+- Runtime state: `~/.config/vpn-connector/state.json`
+- macOS units: `~/Library/LaunchAgents/com.local.vpn-daemon.plist` and
+  `com.local.vpn-tray.plist`
+- Linux units: `~/.config/systemd/user/pritunl-auto-reconnect.service` and
+  `pritunl-auto-reconnect-tray.service`
+- Linux autostart: `~/.config/autostart/pritunl-auto-reconnect-tray.desktop`
+- Log: macOS `~/Library/Logs/vpn-connector.log`. Linux
+  `~/.local/state/vpn-connector.log`.
 
-## Notes on the post-sleep "no internet" issue
+## Notes on the old no-internet-after-wake bug
 
-The old watchdog misread `pritunl-client list` columns (it used fixed indices
-and read **TYPE** as **STATE**), so it saw `System` instead of `Active` and
-re-issued `start` every 5s — even while the tunnel was already up, which can
-leave the default route/DNS stale after wake. Parsing now maps columns by
-header name, and the watchdog defers on `active`/`connecting`/`system` and
-verifies reachability before dialing. Run `vpn diag` after a wake to confirm
-routing/DNS; only enable `auto_wifi_reset` once diagnostics confirm the
-tunnel is at fault.
+The old watchdog read the wrong column from `pritunl-client list`. It read
+TYPE as STATE, so it saw System instead of Active. It then re-ran start every
+5 seconds even when the tunnel was already up. That left the default route and
+DNS stale after wake. Parsing now maps columns by header name. The watchdog
+waits while the state is active, connecting, or system. It also verifies
+reachability before dialing. Run `vpn diag` after a wake to confirm routing and
+DNS. Only enable `auto_wifi_reset` once diagnostics confirm the tunnel is at
+fault.
 
 ## Uninstall
 
