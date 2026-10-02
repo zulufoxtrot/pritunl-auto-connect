@@ -29,11 +29,45 @@ VPN = str(HERE / "vpn")
 GREEN = (46, 204, 113)
 RED = (231, 76, 60)
 GREY = (127, 140, 141)
+YELLOW = (241, 196, 15)
 ICON_SIZE = 22
+DOT = 9  # status dot diameter
 
 POLL = 5
 
 _should_quit = threading.Event()
+
+ASSET_PATH = HERE / "assets" / "pritunl-base.png"
+
+
+def load_base(size: int = ICON_SIZE):
+    """Pritunl logo scaled to the tray size; None if the asset is missing."""
+    try:
+        from PIL import Image
+        img = Image.open(ASSET_PATH).convert("RGBA")
+        return img.resize((size, size), Image.LANCZOS)
+    except Exception:
+        return None
+
+
+def make_overlay_image(base, color, enabled: bool = True):
+    """Pritunl logo + coloured status dot (optional slash when disabled).
+
+    Used by both backends: PIL (Linux) and NSImage via a PNG round-trip
+    (macOS). Falls back to the old plain circle if Pillow/base is missing.
+    """
+    from PIL import Image, ImageDraw
+    if base is None:
+        img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse([2, 2, ICON_SIZE - 2, ICON_SIZE - 2], fill=color + (255,))
+    else:
+        img = base.copy()
+    d = ImageDraw.Draw(img)
+    d.ellipse([4, 4, 4 + DOT, 4 + DOT], fill=color + (255,), outline=(255, 255, 255, 255), width=1)
+    if not enabled:
+        d.line([4, ICON_SIZE - 4, ICON_SIZE - 4, 4], fill=(255, 255, 255, 255), width=2)
+    return img
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +113,11 @@ def tooltip(info: dict) -> str:
 def color_for(info: dict):
     if not info["enabled"]:
         return GREY
-    return GREEN if info["state"] == "active" else RED
+    if info["state"] == "active":
+        return GREEN
+    if info["state"] == "connecting":
+        return YELLOW
+    return RED
 
 
 def connect_info() -> None:
@@ -97,16 +135,11 @@ def disconnect_info() -> None:
 
 def run_linux() -> int:
     import pystray
-    from PIL import Image, ImageDraw
+
+    base = load_base()
 
     def make_icon(info: dict):
-        color = color_for(info) + (255,)
-        img = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.ellipse([2, 2, ICON_SIZE - 2, ICON_SIZE - 2], fill=color)
-        if not info["enabled"]:
-            d.line([3, ICON_SIZE - 3, ICON_SIZE - 3, 3], fill=(255, 255, 255, 255), width=2)
-        return img
+        return make_overlay_image(base, color_for(info), info["enabled"])
 
     def _bg(fn):
         # pystray runs callbacks on the UI thread — never block it.
@@ -155,13 +188,10 @@ def run_macos() -> int:
         NSApplication,
         NSApplicationActivationPolicyAccessory,
         NSImage,
-        NSMakeRect,
         NSMenu,
         NSMenuItem,
         NSStatusBar,
         NSVariableStatusItemLength,
-        NSBezierPath,
-        NSColor,
     )
     from Foundation import NSTimer
 
@@ -171,28 +201,29 @@ def run_macos() -> int:
             self.app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
             self.statusbar = NSStatusBar.systemStatusBar()
             self.item = self.statusbar.statusItemWithLength_(NSVariableStatusItemLength)
-            self.info = status()
+            self._base = load_base(44)  # Retina-sized base for crisp scaling
+            # Render optimistically (grey "starting") so the icon appears
+            # instantly and never blocks on a slow status() call.
+            self.info = {"state": "unknown", "enabled": True, "client": "", "server": ""}
             self._render()
             self._refresh_async()
             self._schedule()
 
-        def _icon_for(self, color):
-            size = ICON_SIZE
-            # Draw a coloured circle by locking focus on a fresh NSImage.
-            image = NSImage.alloc().initWithSize_((size, size))
-            image.lockFocus()
-            col = NSColor.colorWithSRGBRed_green_blue_alpha_(
-                color[0] / 255.0, color[1] / 255.0, color[2] / 255.0, 1.0
-            )
-            col.setFill()
-            NSBezierPath.bezierPathWithOvalInRect_(NSMakeRect(2, 2, size - 4, size - 4)).fill()
-            image.unlockFocus()
+        def _nsimage(self, color):
+            enabled = bool(self.info.get("enabled", True))
+            img = make_overlay_image(self._base, color, enabled)
+            import io
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            data = bytes(buf.getvalue())
+            image = NSImage.alloc().initWithData_(data)
+            image.setSize_((ICON_SIZE, ICON_SIZE))
             return image
 
         def _render(self):
             # Pure UI: runs on the main thread from cached info, never blocks.
             info = self.info
-            self.item.button().setImage_(self._icon_for(color_for(info)))
+            self.item.button().setImage_(self._nsimage(color_for(info)))
             self.item.button().setToolTip_(tooltip(info))
             menu = NSMenu.alloc().init()
             active = info["state"] == "active"
@@ -220,12 +251,14 @@ def run_macos() -> int:
 
         def _refresh_async(self):
             def bg():
-                self.info = status()
+                self.info = status()  # worker thread does the slow work
                 self._do_on_main("_render")
             threading.Thread(target=bg, daemon=True).start()
 
         def toggleConnect_(self, _sender):
             want_disconnect = self.info["state"] == "active"
+            self.info = dict(self.info, state="connecting")  # optimistic feedback
+            self._render()
 
             def bg():
                 (disconnect_info() if want_disconnect else connect_info())
@@ -235,6 +268,8 @@ def run_macos() -> int:
 
         def toggleAuto_(self, _sender):
             want_off = self.info["enabled"]
+            self.info = dict(self.info, enabled=not want_off)
+            self._render()
 
             def bg():
                 run_vpn("disable" if want_off else "enable")
@@ -249,7 +284,8 @@ def run_macos() -> int:
         def _tick(self, _timer):
             if _should_quit.is_set():
                 return
-            self._refresh_async()
+            self._render()        # repaint instantly from cache
+            self._refresh_async() # then poll in background
             self._schedule()
 
         def _schedule(self):
