@@ -1,6 +1,10 @@
 # Real config contains secrets (TOTP secret, PIN) - never commit
 config.json
 
+# Generated launchd plists (created by 'vpn install' into ~/Library/LaunchAgents)
+com.local.vpn-daemon.plist
+com.local.vpn-tray.plist
+
 # Python
 __pycache__/
 *.pyc
